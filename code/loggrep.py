@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""loggrep - Log searcher with JSON profiles (pure Python version).
+"""loggrep - Buscador de logs con perfiles JSON (versión Python pura).
 
-Quick usage:
-    python loggrep.py app.log -p errors
+Uso rápido:
+    python loggrep.py app.log -p errores
     python loggrep.py app.log -e "Timeout" -e "Failed password" -i
-    python loggrep.py app.log -p security_audit --export report.csv
+    python loggrep.py app.log -p security_audit --export informe.csv
     python loggrep.py --list-profiles
 
-Uses only the standard library. The search engine is a swappable function
-(see ENGINES): the C engine will be plugged in there later.
+Solo usa la biblioteca estándar. El motor de búsqueda es una función
+intercambiable (ver ENGINES): más adelante añadiremos aquí el motor en C.
 """
 
 import argparse
@@ -23,9 +23,9 @@ from pathlib import Path
 
 DEFAULT_QUERIES = Path(__file__).with_name("queries.json")
 
-# --- ANSI colors ------------------------------------------------------------
+# --- Colores ANSI -----------------------------------------------------------
 RESET = "\033[0m"
-HIGHLIGHT = "\033[1;7m"  # bold + inverse video for the matched text
+HIGHLIGHT = "\033[1;7m"  # negrita + vídeo inverso para la coincidencia
 LEVEL_COLORS = {
     "CRITICAL": "\033[1;31m",
     "ERROR": "\033[31m",
@@ -35,22 +35,22 @@ LEVEL_COLORS = {
 }
 
 
-# --- Configuration ----------------------------------------------------------
+# --- Configuración ----------------------------------------------------------
 def load_config(path):
     try:
         with open(path, encoding="utf-8") as f:
             config = json.load(f)
     except FileNotFoundError:
-        sys.exit(f"Error: profiles file '{path}' not found.")
+        sys.exit(f"Error: no existe el archivo de perfiles '{path}'.")
     except json.JSONDecodeError as e:
-        sys.exit(f"Error: '{path}' is not valid JSON (line {e.lineno}, column {e.colno}): {e.msg}")
+        sys.exit(f"Error: '{path}' no es un JSON válido (línea {e.lineno}, columna {e.colno}): {e.msg}")
     if not isinstance(config.get("profiles", {}), dict):
-        sys.exit("Error: 'profiles' must be an object in queries.json.")
+        sys.exit("Error: 'profiles' debe ser un objeto en queries.json.")
     return config
 
 
 def build_level_regexes(config):
-    """One regex (over bytes) per level, in the order they appear in the JSON."""
+    """Un regex (sobre bytes) por nivel, en el orden en que aparecen en el JSON."""
     levels = config.get("levels", {})
     result = []
     for name, words in levels.items():
@@ -68,7 +68,7 @@ def classify(line, level_regexes):
 
 # --- Matcher ----------------------------------------------------------------
 class Matcher:
-    """Combines literal patterns and regexes into a single compiled regex."""
+    """Combina patrones literales y regex en un único regex compilado."""
 
     def __init__(self, literals, regexes, excludes, ignore_case):
         flags = re.IGNORECASE if ignore_case else 0
@@ -78,7 +78,7 @@ class Matcher:
             self.include_str = re.compile(expr, flags)
             self.include_bytes = re.compile(expr.encode("utf-8"), flags)
         except re.error as e:
-            sys.exit(f"Error in regular expression: {e}")
+            sys.exit(f"Error en la expresión regular: {e}")
         if excludes:
             exc = "|".join(re.escape(x) for x in excludes)
             self.exclude_bytes = re.compile(exc.encode("utf-8"), flags)
@@ -86,7 +86,7 @@ class Matcher:
             self.exclude_bytes = None
 
 
-# --- Search engines ---------------------------------------------------------
+# --- Motores de búsqueda ----------------------------------------------------
 class Stats:
     def __init__(self):
         self.lines = 0
@@ -96,10 +96,10 @@ class Stats:
 
 
 def search_python(path, matcher, stats):
-    """Yields (line_number, line_bytes) for every match.
+    """Genera (numero_de_linea, linea_en_bytes) por cada coincidencia.
 
-    Reads in binary mode and only decodes the lines that match, so it is
-    faster than working with text and never fails on odd encodings.
+    Lee en binario y solo decodifica las líneas que coinciden, así que es más
+    rápido que trabajar con texto y no falla con codificaciones raras.
     """
     include = matcher.include_bytes.search
     exclude = matcher.exclude_bytes.search if matcher.exclude_bytes else None
@@ -111,16 +111,16 @@ def search_python(path, matcher, stats):
                     yield n, line.rstrip(b"\r\n")
         finally:
             stats.lines = n
-            stats.bytes = f.tell()  # bytes actually read (useful with --max)
+            stats.bytes = f.tell()  # bytes realmente leídos (útil con --max)
 
 
-# To add the C engine later: a function with the same signature as
-# search_python that launches the binary with subprocess and yields
-# (number, line_bytes) while reading its stdout.
+# Para añadir el motor en C más adelante: una función con la misma firma que
+# search_python que lance el binario con subprocess y vaya produciendo
+# (numero, linea_en_bytes) leyendo su stdout.
 ENGINES = {"python": search_python}
 
 
-# --- Output -----------------------------------------------------------------
+# --- Salida -----------------------------------------------------------------
 def highlight(text, rx, base):
     out, last = [], 0
     for m in rx.finditer(text):
@@ -143,17 +143,17 @@ def format_line(n, text, level, rx, use_color):
 
 
 class Exporter:
-    """Streams matches to a .txt, .csv or .json file."""
+    """Escribe las coincidencias en streaming a .txt, .csv o .json."""
 
     def __init__(self, path):
         self.kind = Path(path).suffix.lower().lstrip(".")
         if self.kind not in ("txt", "csv", "json"):
-            sys.exit("Error: --export must end in .txt, .csv or .json")
+            sys.exit("Error: --export debe terminar en .txt, .csv o .json")
         self.f = open(path, "w", encoding="utf-8", newline="")
         self.first = True
         if self.kind == "csv":
             self.writer = csv.writer(self.f)
-            self.writer.writerow(["line", "level", "text"])
+            self.writer.writerow(["linea", "nivel", "texto"])
         elif self.kind == "json":
             self.f.write("[\n")
 
@@ -165,7 +165,7 @@ class Exporter:
         else:
             if not self.first:
                 self.f.write(",\n")
-            self.f.write("  " + json.dumps({"line": n, "level": level, "text": text}, ensure_ascii=False))
+            self.f.write("  " + json.dumps({"linea": n, "nivel": level, "texto": text}, ensure_ascii=False))
             self.first = False
 
     def close(self):
@@ -178,37 +178,37 @@ def print_stats(stats, elapsed):
     mb = stats.bytes / 1_000_000
     rate_mb = mb / elapsed if elapsed > 0 else 0
     rate_lines = stats.lines / elapsed if elapsed > 0 else 0
-    print("\n--- Summary ---", file=sys.stderr)
-    print(f"Lines scanned : {stats.lines:,}", file=sys.stderr)
-    print(f"Matches       : {stats.matches:,}", file=sys.stderr)
+    print("\n--- Resumen ---", file=sys.stderr)
+    print(f"Líneas escaneadas : {stats.lines:,}", file=sys.stderr)
+    print(f"Coincidencias     : {stats.matches:,}", file=sys.stderr)
     if stats.levels:
         detail = ", ".join(f"{k}={v:,}" for k, v in stats.levels.most_common())
-        print(f"By level      : {detail}", file=sys.stderr)
-    print(f"Time          : {elapsed:.2f} s", file=sys.stderr)
-    print(f"Speed         : {rate_mb:,.1f} MB/s ({rate_lines:,.0f} lines/s)", file=sys.stderr)
+        print(f"Por nivel         : {detail}", file=sys.stderr)
+    print(f"Tiempo            : {elapsed:.2f} s", file=sys.stderr)
+    print(f"Velocidad         : {rate_mb:,.1f} MB/s ({rate_lines:,.0f} líneas/s)", file=sys.stderr)
 
 
 # --- CLI --------------------------------------------------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Log searcher with JSON profiles.")
-    p.add_argument("file", nargs="?", help="log file to analyze")
-    p.add_argument("-p", "--profile", help="profile name in queries.json")
-    p.add_argument("-q", "--queries", default=str(DEFAULT_QUERIES), help="path to the profiles JSON")
-    p.add_argument("-e", "--pattern", action="append", default=[], help="literal text to search for (repeatable)")
-    p.add_argument("-r", "--regex", action="append", default=[], help="regular expression (repeatable)")
-    p.add_argument("-x", "--exclude", action="append", default=[], help="exclude lines containing this text (repeatable)")
-    p.add_argument("-i", "--ignore-case", action="store_true", help="case-insensitive matching")
-    p.add_argument("-m", "--max", type=int, default=0, help="stop after N matches")
-    p.add_argument("--count", action="store_true", help="do not print lines, only the summary")
-    p.add_argument("--export", metavar="FILE", help="export matches (.txt, .csv or .json)")
-    p.add_argument("--no-color", action="store_true", help="disable colors")
-    p.add_argument("--engine", choices=sorted(ENGINES), default="python", help="search engine")
-    p.add_argument("--list-profiles", action="store_true", help="list available profiles and exit")
+    p = argparse.ArgumentParser(description="Buscador de logs con perfiles JSON.")
+    p.add_argument("file", nargs="?", help="archivo de log a analizar")
+    p.add_argument("-p", "--profile", help="nombre del perfil en queries.json")
+    p.add_argument("-q", "--queries", default=str(DEFAULT_QUERIES), help="ruta del JSON de perfiles")
+    p.add_argument("-e", "--pattern", action="append", default=[], help="texto literal a buscar (repetible)")
+    p.add_argument("-r", "--regex", action="append", default=[], help="expresión regular (repetible)")
+    p.add_argument("-x", "--exclude", action="append", default=[], help="excluir líneas con este texto (repetible)")
+    p.add_argument("-i", "--ignore-case", action="store_true", help="ignorar mayúsculas/minúsculas")
+    p.add_argument("-m", "--max", type=int, default=0, help="parar tras N coincidencias")
+    p.add_argument("--count", action="store_true", help="no imprimir líneas, solo el resumen")
+    p.add_argument("--export", metavar="ARCHIVO", help="exportar coincidencias (.txt, .csv o .json)")
+    p.add_argument("--no-color", action="store_true", help="desactivar colores")
+    p.add_argument("--engine", choices=sorted(ENGINES), default="python", help="motor de búsqueda")
+    p.add_argument("--list-profiles", action="store_true", help="listar perfiles disponibles y salir")
     return p.parse_args()
 
 
 def setup_console():
-    # Make the Windows cmd interpret ANSI codes and display UTF-8.
+    # Que cmd de Windows interprete los códigos ANSI y muestre UTF-8.
     os.system("")
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -229,16 +229,16 @@ def main():
         return
 
     if not args.file:
-        sys.exit("Error: specify the log file. Example: python loggrep.py app.log -p errors")
+        sys.exit("Error: indica el archivo de log. Ejemplo: python loggrep.py app.log -p errores")
     if not os.path.isfile(args.file):
-        sys.exit(f"Error: file '{args.file}' not found.")
+        sys.exit(f"Error: no existe el archivo '{args.file}'.")
 
     literals, regexes, excludes = list(args.pattern), list(args.regex), list(args.exclude)
     severity, ignore_case = None, args.ignore_case
     if args.profile:
         prof = profiles.get(args.profile)
         if prof is None:
-            sys.exit(f"Error: profile '{args.profile}' does not exist. Available: {', '.join(profiles) or '(none)'}")
+            sys.exit(f"Error: el perfil '{args.profile}' no existe. Disponibles: {', '.join(profiles) or '(ninguno)'}")
         literals += prof.get("patterns", [])
         regexes += prof.get("regex", []) if isinstance(prof.get("regex", []), list) else [prof["regex"]]
         excludes += prof.get("exclude", [])
@@ -246,7 +246,7 @@ def main():
         ignore_case = ignore_case or prof.get("ignore_case", False)
 
     if not literals and not regexes:
-        sys.exit("Error: specify a profile (-p) or at least one pattern (-e) or regex (-r).")
+        sys.exit("Error: indica un perfil (-p) o al menos un patrón (-e) o regex (-r).")
 
     matcher = Matcher(literals, regexes, excludes, ignore_case)
     level_regexes = build_level_regexes(config)
@@ -261,7 +261,7 @@ def main():
         for n, raw in results:
             stats.matches += 1
             level = classify(raw, level_regexes) or severity
-            stats.levels[level or "NO_LEVEL"] += 1
+            stats.levels[level or "SIN_NIVEL"] += 1
             text = raw.decode("utf-8", errors="replace")
             if exporter:
                 exporter.write(n, level, text)
@@ -271,7 +271,7 @@ def main():
                 results.close()
                 break
     except BrokenPipeError:
-        # For example: python loggrep.py app.log -p errors | more
+        # Por ejemplo: python loggrep.py app.log -p errores | more
         sys.stderr.close()
         return
     finally:
