@@ -14,4 +14,5 @@ A command-line utility designed to search for patterns, regular expressions, and
 - made pure python code to do tests
 - done queries.json
 - made python log_gen. Generates 1 million logs in test.log
-Comments: With resource-intensive regex patterns—such as those for IP addresses—performance drops to around 15 MB/s. My own system may yield different figures, but I will make a note of them; they set the benchmark that the C-based engine will need to surpass.
+
+-- Comments: With resource-intensive regex patterns—such as those for IP addresses—performance drops to around 15 MB/s. My own system may yield different figures, but I will make a note of them; they set the benchmark that the C-based engine will need to surpass. Look in notes folder
