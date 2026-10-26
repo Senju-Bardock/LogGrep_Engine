@@ -54,9 +54,8 @@ def load_config(path):
     return config
 
 
-def build_level_regexes(config):
+def build_level_regexes(levels):
     """One regex (over bytes) per level, in the order they appear in the JSON."""
-    levels = config.get("levels", {})
     result = []
     for name, words in levels.items():
         expr = r"\b(?:" + "|".join(re.escape(w) for w in words) + r")\b"
@@ -102,29 +101,36 @@ class Stats:
         self.bytes = 0
         self.matches = 0
         self.levels = Counter()
+        self.c_counts = None  # per-level counts reported by the C engine (count-only mode)
 
 
-def search_python(path, matcher, stats, max_matches=0):
-    """Yields (line_number, line_bytes) for every match.
+def search_python(path, matcher, stats, max_matches=0, levels=None, count_only=False,
+                  export=None, severity=None):
+    """Yields (line_number, line_bytes, level) for every match.
 
     Reads in binary mode and only decodes the lines that match, so it is
     faster than working with text and never fails on odd encodings.
     """
     include = matcher.include_bytes.search
     exclude = matcher.exclude_bytes.search if matcher.exclude_bytes else None
+    level_regexes = build_level_regexes(levels or {})
     n = 0
     with open(path, "rb") as f:
         try:
             for n, line in enumerate(f, 1):
                 if include(line) and not (exclude and exclude(line)):
-                    yield n, line.rstrip(b"\r\n")
+                    text = line.rstrip(b"\r\n")
+                    yield n, text, classify(text, level_regexes)
         finally:
             stats.lines = n
             stats.bytes = f.tell()  # bytes actually read (useful with --max)
 
 
-C_MAX_PATTERNS = 64  # limit compiled into log_searcher.c
-STATS_RE = re.compile(rb"#stats lines=(\d+) bytes=(\d+) matches=(\d+)")
+C_MAX_PATTERNS = 64  # limits compiled into log_searcher.c
+C_MAX_LEVELS = 16
+C_MAX_LEVEL_WORDS = 16
+C_MAX_LEVEL_NAME = 31
+STATS_RE = re.compile(rb"#stats lines=(\d+) bytes=(\d+) matches=(\d+)(?: levels=(\S+))?")
 
 
 def find_c_binary():
@@ -138,7 +144,23 @@ def find_c_binary():
     return shutil.which("log_searcher")
 
 
-def c_unsupported_reason(matcher):
+def c_levels_supported(levels):
+    """True if every level definition fits what log_searcher accepts with -l."""
+    if len(levels) > C_MAX_LEVELS:
+        return False
+    for name, words in levels.items():
+        if not name or name == "-" or len(name) > C_MAX_LEVEL_NAME:
+            return False
+        if not name.isascii() or any(ch in name for ch in "|,:="):
+            return False
+        if not words or len(words) > C_MAX_LEVEL_WORDS:
+            return False
+        if any((not w) or (not w.isascii()) or ("," in w) or len(w) >= 256 for w in words):
+            return False
+    return True
+
+
+def c_unsupported_reason(matcher, levels, paths=()):
     """Returns why the C engine cannot run this search, or None if it can."""
     if matcher.regexes:
         return "the C engine only supports literal patterns, not regular expressions"
@@ -146,15 +168,25 @@ def c_unsupported_reason(matcher):
         return f"the C engine accepts at most {C_MAX_PATTERNS} patterns of each kind"
     if not all(t.isascii() for t in matcher.literals + matcher.excludes):
         return "the C engine only supports ASCII patterns"
+    if not all(p.isascii() for p in paths):
+        return "the C engine only supports ASCII file paths"
+    if not c_levels_supported(levels):
+        return "the level definitions in queries.json are outside what the C engine supports"
     return None
 
 
-def search_c(path, matcher, stats, max_matches=0):
-    """Runs log_searcher and yields (line_number, line_bytes) from its stdout.
+def search_c(path, matcher, stats, max_matches=0, levels=None, count_only=False,
+             export=None, severity=None):
+    """Runs log_searcher and yields (line_number, line_bytes, level) from its stdout.
 
-    The binary prints one 'number|content' line per match and a final
-    '#stats lines=N bytes=N matches=N' line on stderr.
+    The binary prints one 'number|LEVEL|content' line per match (the level
+    column is only present when levels are passed with -l) and a final
+    '#stats ...' line on stderr. In count-only mode it prints no lines at all
+    and the totals are taken from the stats line. When 'export' is a
+    (path, kind) pair, log_searcher writes the export file itself, which is
+    much faster than formatting every row in Python.
     """
+    levels = levels or {}
     binary = find_c_binary()
     if not binary:
         sys.exit("Error: log_searcher not found. Build it with: "
@@ -164,6 +196,14 @@ def search_c(path, matcher, stats, max_matches=0):
         cmd.append("-i")
     if max_matches:
         cmd += ["-m", str(max_matches)]
+    if count_only:
+        cmd.append("-c")
+    for name, words in levels.items():
+        cmd += ["-l", f"{name}={','.join(words)}"]
+    if export:
+        cmd += ["-o", export[0], "-F", export[1]]
+        if severity:
+            cmd += ["-s", severity]
     for text in matcher.literals:
         cmd += ["-e", text]
     for text in matcher.excludes:
@@ -173,19 +213,35 @@ def search_c(path, matcher, stats, max_matches=0):
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1 << 20)
     try:
         for raw in proc.stdout:
-            sep = raw.index(b"|")
-            yield int(raw[:sep]), raw[sep + 1:].rstrip(b"\n")
+            if levels:
+                number, level, text = raw.split(b"|", 2)
+                yield int(number), text.rstrip(b"\n"), (level.decode("ascii") or None)
+            else:
+                number, text = raw.split(b"|", 1)
+                yield int(number), text.rstrip(b"\n"), None
     finally:
-        # If the consumer stopped early, the process may still be running.
-        if proc.poll() is None:
-            proc.terminate()
+        # If the consumer stopped early (for example with --max) the process is
+        # about to end by itself: closing the pipe makes it stop writing, and
+        # waiting lets it print its #stats line. Terminate it if it does not.
         proc.stdout.close()
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            proc.wait()
         err = proc.stderr.read()
         proc.stderr.close()
-        code = proc.wait()
+        code = proc.returncode
         found = STATS_RE.search(err)
         if found:
             stats.lines, stats.bytes = int(found.group(1)), int(found.group(2))
+            if count_only:
+                stats.matches = int(found.group(3))
+                stats.c_counts = {}
+                if found.group(4):
+                    for item in found.group(4).decode("ascii").split(","):
+                        name, _, count = item.rpartition(":")
+                        stats.c_counts[name] = int(count)
         if code == 2:
             sys.exit("Error from log_searcher: " + err.decode("utf-8", errors="replace").strip())
 
@@ -193,11 +249,11 @@ def search_c(path, matcher, stats, max_matches=0):
 ENGINES = {"python": search_python, "c": search_c}
 
 
-def select_engine(requested, matcher):
+def select_engine(requested, matcher, levels, paths=()):
     """Resolves --engine (auto/python/c) into the name of the engine to run."""
     if requested == "python":
         return "python"
-    reason = c_unsupported_reason(matcher)
+    reason = c_unsupported_reason(matcher, levels, paths)
     if requested == "c":
         if reason:
             sys.exit(f"Error: cannot use --engine c: {reason}.")
@@ -230,13 +286,19 @@ def format_line(n, text, level, rx, use_color):
     return f"\033[2m{n:>9} |{RESET} {base}{tag}{highlight(text, rx, base)}{RESET}"
 
 
+def export_kind(path):
+    """Export format from the file extension; exits with an error if unsupported."""
+    kind = Path(path).suffix.lower().lstrip(".")
+    if kind not in ("txt", "csv", "json"):
+        sys.exit("Error: --export must end in .txt, .csv or .json")
+    return kind
+
+
 class Exporter:
-    """Streams matches to a .txt, .csv or .json file."""
+    """Streams matches to a .txt, .csv or .json file (used by the Python engine)."""
 
     def __init__(self, path):
-        self.kind = Path(path).suffix.lower().lstrip(".")
-        if self.kind not in ("txt", "csv", "json"):
-            sys.exit("Error: --export must end in .txt, .csv or .json")
+        self.kind = export_kind(path)
         self.f = open(path, "w", encoding="utf-8", newline="")
         self.first = True
         if self.kind == "csv":
@@ -339,18 +401,27 @@ def main():
         sys.exit("Error: specify a profile (-p) or at least one pattern (-e) or regex (-r).")
 
     matcher = Matcher(literals, regexes, excludes, ignore_case)
-    level_regexes = build_level_regexes(config)
+    levels = config.get("levels", {})
     use_color = not args.no_color and sys.stdout.isatty()
-    exporter = Exporter(args.export) if args.export else None
+    kind = export_kind(args.export) if args.export else None
     stats = Stats()
-    engine_name = select_engine(args.engine, matcher)
+    engine_name = select_engine(args.engine, matcher, levels, [args.file])
+    # The C engine writes the export file itself when it can (ASCII paths and names);
+    # otherwise Python formats every row.
+    c_export = None
+    if kind and engine_name == "c" and args.export.isascii() and (severity or "").isascii():
+        c_export = (args.export, kind)
+    exporter = Exporter(args.export) if args.export and not c_export else None
+    # With --count and nothing to export from Python, the lines are not needed at all.
+    count_only = args.count and exporter is None
 
     start = time.perf_counter()
-    results = ENGINES[engine_name](args.file, matcher, stats, args.max)
+    results = ENGINES[engine_name](args.file, matcher, stats, args.max, levels, count_only,
+                                   c_export, severity)
     try:
-        for n, raw in results:
+        for n, raw, level in results:
             stats.matches += 1
-            level = classify(raw, level_regexes) or severity
+            level = level or severity
             stats.levels[level or "NO_LEVEL"] += 1
             text = raw.decode("utf-8", errors="replace")
             if exporter:
@@ -367,6 +438,10 @@ def main():
     finally:
         if exporter:
             exporter.close()
+    if stats.c_counts is not None:  # count-only run: merge the totals reported by C
+        for name, count in stats.c_counts.items():
+            if count:
+                stats.levels[(None if name == "-" else name) or severity or "NO_LEVEL"] += count
     print_stats(stats, time.perf_counter() - start, engine_name)
 
 
