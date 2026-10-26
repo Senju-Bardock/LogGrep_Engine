@@ -24,6 +24,8 @@ A command-line utility designed to search for patterns, regular expressions, and
 - integrated c in loggrep code
 - some bugs have been fixed and got even way faster
 
+-- Comments: There is 2 bottlenecks I'm trying to solve, from now on, nmap will be put on the side and for some days I'll be investigating how can I solve this and make this even faster. Maybe I will have to do a new python code just to check anyways. For now, I seem to make a solution for the first bottleneck that stresses me, but it is not solved yet.
+
 ### 26/10/2026
 
 - made selftest.py
