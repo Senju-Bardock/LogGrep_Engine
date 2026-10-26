@@ -1,0 +1,122 @@
+C:\Users\Usuario\Downloads\code>dir
+ El volumen de la unidad C no tiene etiqueta.
+ El número de serie del volumen es: 6446-983A
+
+ Directorio de C:\Users\Usuario\Downloads\code
+
+20/10/2026  14:01    <DIR>          .
+20/10/2026  14:07    <DIR>          ..
+20/10/2026  13:14             2.419 gen_logs.py
+20/10/2026  13:33            10.830 loggrep.py
+20/10/2026  13:14             1.182 queries.json
+               3 archivos         14.431 bytes
+               2 dirs  402.213.515.264 bytes libres
+
+C:\Users\Usuario\Downloads\code>python gen_logs.py
+Generated 1,000,000 lines in test.log
+
+C:\Users\Usuario\Downloads\code>python loggrep.py --list-profiles
+errors           Application errors and critical failures
+warnings         Application warnings
+security_audit   Failed and unauthorized access attempts
+api_performance  HTTP 500 errors, timeouts and database connection losses
+ips              Any line containing an IP address
+
+C:\Users\Usuario\Downloads\code>python loggrep.py test.log -p security_audit -m 10
+       25 | [ERROR] 2026-10-01 00:00:05 sshd: Invalid user guest from 79.20.189.35
+       54 | [ERROR] 2026-10-01 00:00:11 sshd: Failed password for invalid user admin from 246.228.124.61 port 56973
+       72 | [ERROR] 2026-10-01 00:00:15 sshd: Invalid user guest from 210.69.57.191
+       77 | [ERROR] 2026-10-01 00:00:16 sshd: Failed password for invalid user admin from 99.19.218.115 port 55663
+      110 | [ERROR] 2026-10-01 00:00:23 sshd: Invalid user guest from 77.30.130.112
+      115 | [ERROR] 2026-10-01 00:00:23 sshd: Failed password for invalid user admin from 133.176.104.31 port 12380
+      128 | [ERROR] 2026-10-01 00:00:26 sshd: Failed password for invalid user admin from 193.4.225.212 port 3706
+      134 | [ERROR] 2026-10-01 00:00:27 sshd: Invalid user guest from 163.140.191.213
+      171 | [ERROR] 2026-10-01 00:00:34 sshd: Failed password for invalid user admin from 104.50.7.177 port 53827
+      194 | [ERROR] 2026-10-01 00:00:39 sshd: Failed password for invalid user admin from 64.91.111.43 port 48935
+
+--- Summary ---
+Lines scanned : 194
+Matches       : 10
+By level      : ERROR=10
+Time          : 0.01 s
+Speed         : 1.9 MB/s (24,121 lines/s)
+
+C:\Users\Usuario\Downloads\code>python loggrep.py test.log -p errors --count
+
+--- Summary ---
+Lines scanned : 1,000,000
+Matches       : 118,582
+By level      : ERROR=88,887, CRITICAL=29,695
+Time          : 0.82 s
+Speed         : 96.1 MB/s (1,222,940 lines/s)
+
+C:\Users\Usuario\Downloads\code>
+
+
+---
+
+C:\Users\Usuario\Downloads\code>python loggrep.py test.log -e timeout -i --export report.csv
+
+
+[...]
+
+   999696 | [ERROR] 2026-10-03 07:39:57 [ERROR] Timeout calling payment service after 1018ms
+   999749 | [ERROR] 2026-10-03 07:40:07 [ERROR] Timeout calling payment service after 1797ms
+   999751 | [ERROR] 2026-10-03 07:40:07 [ERROR] Timeout calling payment service after 2674ms
+   999789 | [ERROR] 2026-10-03 07:40:14 [ERROR] Timeout calling payment service after 3654ms
+   999827 | [ERROR] 2026-10-03 07:40:20 [ERROR] Timeout calling payment service after 1792ms
+   999849 | [ERROR] 2026-10-03 07:40:24 [ERROR] Timeout calling payment service after 4357ms
+   999852 | [ERROR] 2026-10-03 07:40:24 [ERROR] Timeout calling payment service after 2199ms
+   999890 | [ERROR] 2026-10-03 07:40:32 [ERROR] Timeout calling payment service after 1049ms
+   999904 | [ERROR] 2026-10-03 07:40:34 [ERROR] Timeout calling payment service after 4734ms
+   999975 | [ERROR] 2026-10-03 07:40:48 [ERROR] Timeout calling payment service after 2889ms
+   999990 | [ERROR] 2026-10-03 07:40:51 [ERROR] Timeout calling payment service after 3594ms
+
+--- Summary ---
+Lines scanned : 1,000,000
+Matches       : 29,496
+By level      : ERROR=29,496
+Time          : 1.26 s
+Speed         : 62.4 MB/s (794,409 lines/s)
+
+C:\Users\Usuario\Downloads\code>
+
+C:\Users\Usuario\Downloads\LogGrep_Engine-main\code>gcc -O2 -Wall -Wextra -o log_searcher log_searcher.c
+
+C:\Users\Usuario\Downloads\LogGrep_Engine-main\code>python selftest.py
+30/30 checks passed
+
+C:\Users\Usuario\Downloads\LogGrep_Engine-main\code>python gen_logs.py
+Generated 1,000,000 lines in test.log
+
+C:\Users\Usuario\Downloads\LogGrep_Engine-main\code>python loggrep.py test.log -p errors --export report.csv --count
+
+--- Summary ---
+Lines scanned : 1,000,000
+Matches       : 118,582
+By level      : ERROR=88,887, CRITICAL=29,695
+Time          : 0.16 s
+Speed         : 477.9 MB/s (6,081,286 lines/s)
+Engine        : c
+
+C:\Users\Usuario\Downloads\LogGrep_Engine-main\code>dir
+ El volumen de la unidad C no tiene etiqueta.
+ El número de serie del volumen es: 6446-983A
+
+ Directorio de C:\Users\Usuario\Downloads\LogGrep_Engine-main\code
+
+26/10/2026  09:54    <DIR>          .
+21/10/2026  07:21    <DIR>          ..
+21/10/2026  07:21             2.419 gen_logs.py
+26/10/2026  09:48            18.050 loggrep.py
+26/10/2026  09:48            22.097 log_searcher.c
+26/10/2026  09:51           146.364 log_searcher.exe
+21/10/2026  07:21             1.182 queries.json
+26/10/2026  09:54        10.296.821 report.csv
+26/10/2026  09:48             5.511 selftest.py
+26/10/2026  09:54        78.580.289 test.log
+26/10/2026  09:51    <DIR>          __pycache__
+               8 archivos     89.072.733 bytes
+               3 dirs  420.537.298.944 bytes libres
+
+C:\Users\Usuario\Downloads\LogGrep_Engine-main\code>
