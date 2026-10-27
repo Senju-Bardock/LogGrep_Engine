@@ -11,7 +11,9 @@ Usage (log_searcher must be built first):
 """
 
 import json
+import os
 import random
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -89,6 +91,38 @@ def run(engine, log, queries, extra, export=None):
     return proc.stdout, summary, proc.returncode
 
 
+def check_chunk_boundaries(tmp, log):
+    """Builds log_searcher with a tiny mapping chunk (64 bytes) and compares it
+    with the buffered reader: this exercises every chunk-boundary case of the
+    memory-mapped scan on a small file. Returns (checks, failures)."""
+    compiler = shutil.which("gcc") or shutil.which("cc")
+    source = HERE / "log_searcher.c"
+    if not compiler or not source.exists():
+        print("skip  chunk-boundary check (needs gcc and log_searcher.c next to this script)")
+        return 0, 0
+    tiny = tmp / ("tiny.exe" if os.name == "nt" else "tiny")
+    build = subprocess.run([compiler, "-O2", "-DMAP_CHUNK=64", "-o", str(tiny), str(source)], capture_output=True)
+    if build.returncode != 0:
+        print("skip  chunk-boundary check (could not compile the test build)")
+        return 0, 0
+    levels = ["-l", "CRITICAL=CRITICAL,FATAL", "-l", "ERROR=ERROR", "-l", "WARN=WARN,WARNING"]
+    searches = [
+        ["-e", "TESTLINE"], ["-e", "ERROR", "-e", "WARN"], ["-e", "a", "-e", "b"], ["-e", "TESTLINE", "-i"],
+        ["-e", "TESTLINE", "-x", "EXCLUDEME"], ["-e", "TESTLINE", "-m", "37"], ["-e", "THIS_NEVER_APPEARS"],
+    ]
+    checks = failures = 0
+    for extra in searches:
+        for flags in ([], ["-c"]):
+            cmd = extra + levels + flags + [str(log)]
+            a = subprocess.run([str(tiny)] + cmd, capture_output=True)
+            b = subprocess.run([str(tiny), "-B"] + cmd, capture_output=True)
+            checks += 1
+            if (a.stdout, a.stderr, a.returncode) != (b.stdout, b.stderr, b.returncode):
+                failures += 1
+                print(f"FAIL  chunk boundaries: {' '.join(extra + flags)}")
+    return checks, failures
+
+
 def main():
     if not loggrep.find_c_binary():
         sys.exit("log_searcher not found. Build it first: "
@@ -114,8 +148,9 @@ def main():
             for mode, flags in (("lines", []), ("count", ["--count"])):
                 py = run("python", log, queries, extra + flags)
                 c = run("c", log, queries, extra + flags)
+                c_blocks = run("c", log, queries, extra + flags + ["--no-mmap"])
                 checks += 1
-                if py != c:
+                if py != c or py != c_blocks:
                     failures += 1
                     print(f"FAIL  {name} [{mode}]: console output or summary differ")
             # exported files, byte by byte
@@ -130,6 +165,9 @@ def main():
                     print(f"FAIL  {name} [export .{kind}]: files differ ({len(a)} vs {len(b)} bytes)")
                 elif kind == "json":
                     json.loads(a.decode("utf-8"))  # must also be valid JSON
+        extra_checks, extra_failures = check_chunk_boundaries(tmp, log)
+        checks += extra_checks
+        failures += extra_failures
         print(f"{checks - failures}/{checks} checks passed")
     sys.exit(1 if failures else 0)
 

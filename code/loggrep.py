@@ -105,7 +105,7 @@ class Stats:
 
 
 def search_python(path, matcher, stats, max_matches=0, levels=None, count_only=False,
-                  export=None, severity=None):
+                  export=None, severity=None, no_mmap=False):
     """Yields (line_number, line_bytes, level) for every match.
 
     Reads in binary mode and only decodes the lines that match, so it is
@@ -168,6 +168,8 @@ def c_unsupported_reason(matcher, levels, paths=()):
         return f"the C engine accepts at most {C_MAX_PATTERNS} patterns of each kind"
     if not all(t.isascii() for t in matcher.literals + matcher.excludes):
         return "the C engine only supports ASCII patterns"
+    if any(ch in t for t in matcher.literals + matcher.excludes for ch in "\r\n"):
+        return "the C engine does not support patterns with line breaks"
     if not all(p.isascii() for p in paths):
         return "the C engine only supports ASCII file paths"
     if not c_levels_supported(levels):
@@ -176,7 +178,7 @@ def c_unsupported_reason(matcher, levels, paths=()):
 
 
 def search_c(path, matcher, stats, max_matches=0, levels=None, count_only=False,
-             export=None, severity=None):
+             export=None, severity=None, no_mmap=False):
     """Runs log_searcher and yields (line_number, line_bytes, level) from its stdout.
 
     The binary prints one 'number|LEVEL|content' line per match (the level
@@ -198,6 +200,8 @@ def search_c(path, matcher, stats, max_matches=0, levels=None, count_only=False,
         cmd += ["-m", str(max_matches)]
     if count_only:
         cmd.append("-c")
+    if no_mmap:
+        cmd.append("-B")
     for name, words in levels.items():
         cmd += ["-l", f"{name}={','.join(words)}"]
     if export:
@@ -355,6 +359,8 @@ def parse_args():
     p.add_argument("--no-color", action="store_true", help="disable colors")
     p.add_argument("--engine", choices=["auto", "python", "c"], default="auto",
                    help="search engine: auto uses C when available and possible (default)")
+    p.add_argument("--no-mmap", action="store_true",
+                   help="C engine: read the file in blocks instead of memory-mapping it")
     p.add_argument("--list-profiles", action="store_true", help="list available profiles and exit")
     return p.parse_args()
 
@@ -417,7 +423,7 @@ def main():
 
     start = time.perf_counter()
     results = ENGINES[engine_name](args.file, matcher, stats, args.max, levels, count_only,
-                                   c_export, severity)
+                                   c_export, severity, args.no_mmap)
     try:
         for n, raw, level in results:
             stats.matches += 1

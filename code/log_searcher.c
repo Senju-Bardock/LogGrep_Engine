@@ -1,16 +1,27 @@
 /*
- * log_searcher.c - LogGrep search engine, version 0.3
+ * log_searcher.c - LogGrep search engine, version 0.4
  *
- * Reads a log file in large blocks, searches every line for literal patterns
- * with the Boyer-Moore-Horspool algorithm and prints each match to stdout.
+ * Searches a log file for literal patterns with the Boyer-Moore-Horspool
+ * algorithm and prints each matching line to stdout.
+ *
+ * The file is memory-mapped (mmap on Linux/macOS, MapViewOfFile on Windows)
+ * and searched in chunks of 4 MiB (small enough to stay in the CPU cache):
+ * each pattern is looked for in the raw bytes of the chunk, so lines without
+ * a match are skipped without being visited one by one. If the file cannot be mapped (empty, special file...)
+ * or -B is given, it is read in 1 MiB blocks and checked line by line; both
+ * ways give exactly the same results.
+ *
+ * Caution: if another program truncates the file while it is mapped, the
+ * process may crash. Use -B to read log files that are being rotated in place.
  *
  * Usage:
- *     log_searcher [-i] [-c] [-m N] [-x EXCLUDE]... [-l LEVEL=WORD,WORD]...
+ *     log_searcher [-i] [-c] [-B] [-m N] [-x EXCLUDE]... [-l LEVEL=WORD,WORD]...
  *                  [-o OUTFILE -F txt|csv|json [-s SEVERITY]]
  *                  -e PATTERN [-e PATTERN]... FILE
  *
  *     -e PATTERN        literal text to search for (repeatable, a line matches
- *                       if it contains ANY of the patterns)
+ *                       if it contains ANY of the patterns). It cannot contain
+ *                       a newline.
  *     -x EXCLUDE        skip lines containing this text (repeatable)
  *     -i                ignore case for -e and -x (ASCII only)
  *     -m N              stop after N matches
@@ -20,6 +31,7 @@
  *                       exact case (like the regex \b(?:W1|W2)\b). Words are
  *                       expected to start and end with letters, digits or '_'.
  *     -c                count only: do not print lines, just the #stats line
+ *     -B                do not use memory mapping: read the file in blocks
  *     -o OUTFILE        also write every match to OUTFILE (needs -F)
  *     -F FORMAT         format of OUTFILE: txt, csv or json. The files are
  *                       byte-identical to the ones the Python exporter writes:
@@ -47,7 +59,12 @@
  *     gcc -O2 -Wall -Wextra -o log_searcher log_searcher.c
  */
 
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200112L /* mmap, fstat, posix_madvise */
+#endif
+
 #include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +72,12 @@
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 #define BLOCK_SIZE (1u << 20) /* 1 MiB read block */
@@ -64,6 +87,10 @@
 #define MAX_LEVEL_NAME 32
 #define MAX_WORD_LEN 256
 #define NOT_FOUND ((size_t)-1)
+#define UNKNOWN ((size_t)-2)
+#ifndef MAP_CHUNK
+#define MAP_CHUNK ((size_t)4 << 20) /* 4 MiB searched at a time when mapped */
+#endif
 
 /* Byte -> byte tables used to compare text. */
 static unsigned char fold_exact[256];
@@ -74,6 +101,7 @@ typedef struct {
     size_t len;
     const unsigned char *fold; /* which table this pattern is compared with */
     size_t shift[256];         /* Horspool bad-character table */
+    size_t rare;               /* index of the least frequent byte (see pattern_pick_rare) */
 } Pattern;
 
 typedef struct {
@@ -95,6 +123,7 @@ typedef struct {
     unsigned long long unclassified; /* matches with no level */
     unsigned long long max_matches;  /* 0 = unlimited */
     int count_only;
+    int no_mmap;                     /* -B: always read in blocks */
     FILE *export_fp;                 /* NULL when -o is not used */
     int export_fmt;
     unsigned long long exported;     /* records written to the export file */
@@ -171,6 +200,45 @@ static int word_found(const Pattern *p, const unsigned char *hay, size_t n) {
         }
         from = pos + 1;
     }
+}
+
+/* Picks the byte of the pattern that is rarest in the text, judging by the
+ * byte frequencies of a sample of the file. */
+static void pattern_pick_rare(Pattern *p, const unsigned long long freq[256]) {
+    p->rare = 0;
+    for (size_t i = 1; i < p->len; i++) {
+        if (freq[p->text[i]] < freq[p->text[p->rare]]) {
+            p->rare = i;
+        }
+    }
+}
+
+/* Same result as pattern_find, but for case-sensitive patterns it looks for the
+ * rarest byte of the pattern with memchr (which is vectorised in the C library)
+ * and only compares the whole pattern around those candidates. This reads the
+ * text at memory speed instead of stepping through it with Horspool shifts. */
+static size_t pattern_find_fast(const Pattern *p, const unsigned char *hay, size_t n, size_t from) {
+    if (p->fold != fold_exact) { /* -i: compare through the folding table */
+        return pattern_find(p, hay, n, from);
+    }
+    if (from > n || n - from < p->len) {
+        return NOT_FOUND;
+    }
+    const unsigned char rare_byte = p->text[p->rare];
+    size_t pos = from + p->rare;                 /* first position where the rare byte may be */
+    const size_t last = n - p->len + p->rare;    /* last position where it may be */
+    while (pos <= last) {
+        const unsigned char *hit = memchr(hay + pos, rare_byte, last - pos + 1);
+        if (!hit) {
+            return NOT_FOUND;
+        }
+        size_t at = (size_t)(hit - hay);
+        if (memcmp(hay + at - p->rare, p->text, p->len) == 0) {
+            return at - p->rare;
+        }
+        pos = at + 1;
+    }
+    return NOT_FOUND;
 }
 
 static int line_matches(const Query *q, const unsigned char *line, size_t len) {
@@ -469,8 +537,339 @@ static int handle_line(Query *q, unsigned long long line_no, const unsigned char
     return q->max_matches && *matches >= q->max_matches;
 }
 
+/* ---- Scanning ----------------------------------------------------------- */
+
+/* Reads the file in blocks and checks it line by line. Returns -1 on error. */
+static int scan_buffered(Query *q, FILE *f, unsigned long long *lines_out,
+                         unsigned long long *consumed_out, unsigned long long *matches_out) {
+    size_t cap = BLOCK_SIZE;
+    size_t have = 0; /* bytes currently held in buf */
+    unsigned char *buf = malloc(cap);
+    if (!buf) {
+        fputs("Error: out of memory.\n", stderr);
+        return -1;
+    }
+
+    unsigned long long line_no = 0, matches = 0, consumed = 0;
+    int stop = 0;
+
+    while (!stop) {
+        if (have == cap) { /* a single line is longer than the buffer: grow it */
+            cap *= 2;
+            unsigned char *bigger = realloc(buf, cap);
+            if (!bigger) {
+                fputs("Error: out of memory (line too long).\n", stderr);
+                free(buf);
+                return -1;
+            }
+            buf = bigger;
+        }
+        size_t got = fread(buf + have, 1, cap - have, f);
+        if (got == 0) {
+            break; /* end of file */
+        }
+        have += got;
+
+        size_t start = 0;
+        for (;;) {
+            unsigned char *nl = memchr(buf + start, '\n', have - start);
+            if (!nl) {
+                break;
+            }
+            size_t len = (size_t)(nl - (buf + start));
+            consumed += len + 1;
+            while (len > 0 && buf[start + len - 1] == '\r') { /* CRLF, like Python's rstrip */
+                len--;
+            }
+            line_no++;
+            if (handle_line(q, line_no, buf + start, len, &matches)) {
+                stop = 1;
+                break;
+            }
+            start = (size_t)(nl - buf) + 1;
+        }
+
+        if (!stop) { /* keep the incomplete last line for the next block */
+            memmove(buf, buf + start, have - start);
+            have -= start;
+        }
+    }
+
+    /* Last line of the file when it has no trailing newline. */
+    if (!stop && have > 0) {
+        size_t len = have;
+        consumed += len;
+        while (len > 0 && buf[len - 1] == '\r') {
+            len--;
+        }
+        line_no++;
+        handle_line(q, line_no, buf, len, &matches);
+    }
+
+    free(buf);
+    *lines_out = line_no;
+    *consumed_out = consumed;
+    *matches_out = matches;
+    return 0;
+}
+
+typedef struct {
+    const unsigned char *data;
+    size_t size;
+#ifdef _WIN32
+    HANDLE file;
+    HANDLE mapping;
+#endif
+} MappedFile;
+
+/* Maps the whole file read-only. Returns 0 on success, -1 if it cannot be
+ * mapped (empty file, special file, larger than the address space...): the
+ * caller then falls back to buffered reads. */
+static int map_open(const char *path, MappedFile *m) {
+    memset(m, 0, sizeof *m);
+#ifdef _WIN32
+    HANDLE file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
+        (unsigned long long)size.QuadPart > (unsigned long long)SIZE_MAX) {
+        CloseHandle(file);
+        return -1;
+    }
+    HANDLE mapping = CreateFileMappingA(file, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!mapping) {
+        CloseHandle(file);
+        return -1;
+    }
+    void *view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    if (!view) {
+        CloseHandle(mapping);
+        CloseHandle(file);
+        return -1;
+    }
+    m->data = view;
+    m->size = (size_t)size.QuadPart;
+    m->file = file;
+    m->mapping = mapping;
+    return 0;
+#else
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        (unsigned long long)st.st_size > (unsigned long long)SIZE_MAX) {
+        close(fd);
+        return -1;
+    }
+    void *view = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd); /* the mapping stays valid */
+    if (view == MAP_FAILED) {
+        return -1;
+    }
+#ifdef POSIX_MADV_SEQUENTIAL
+    posix_madvise(view, (size_t)st.st_size, POSIX_MADV_SEQUENTIAL);
+#endif
+    m->data = view;
+    m->size = (size_t)st.st_size;
+    return 0;
+#endif
+}
+
+static void map_close(MappedFile *m) {
+#ifdef _WIN32
+    UnmapViewOfFile(m->data);
+    CloseHandle(m->mapping);
+    CloseHandle(m->file);
+#else
+    munmap((void *)m->data, m->size);
+#endif
+}
+
+/* Number of '\n' bytes in p[0..n). Works on 8 bytes at a time with plain integer
+ * arithmetic (no memchr call per line, no special instructions needed). */
+static unsigned long long count_newlines(const unsigned char *p, size_t n) {
+    const uint64_t newline = 0x0A0A0A0A0A0A0A0AULL;
+    const uint64_t low7 = 0x7F7F7F7F7F7F7F7FULL;
+    const uint64_t pairs = 0x00FF00FF00FF00FFULL;
+    unsigned long long count = 0;
+    size_t i = 0;
+
+    while (n - i >= 8) {
+        size_t words = (n - i) / 8;
+        if (words > 255) {
+            words = 255; /* a byte lane of 'acc' holds at most 255 */
+        }
+        uint64_t acc = 0;
+        for (size_t w = 0; w < words; w++, i += 8) {
+            uint64_t x;
+            memcpy(&x, p + i, 8);
+            x ^= newline; /* bytes that were '\n' are now 0 */
+            uint64_t zero = ~(((x & low7) + low7) | x | low7); /* 0x80 in each zero byte */
+            acc += zero >> 7;
+        }
+        acc = (acc & pairs) + ((acc >> 8) & pairs);
+        count += (acc * 0x0001000100010001ULL) >> 48;
+    }
+    for (; i < n; i++) {
+        count += p[i] == '\n';
+    }
+    return count;
+}
+
+typedef struct {
+    unsigned long long lines; /* lines covered (up to the last one handled when stopped) */
+    size_t consumed;          /* bytes covered */
+    int stop;                 /* the search must end */
+} RegionResult;
+
+/* Searches a region that starts at the beginning of a line and ends at the end
+ * of a line (or of the file). Instead of visiting every line, it looks for the
+ * patterns in the raw bytes, jumps to the line that contains the first
+ * occurrence, checks it and continues after it. Patterns contain no newline,
+ * so no match can span two lines. */
+static RegionResult scan_region(Query *q, const unsigned char *data, size_t size,
+                                unsigned long long first_line_no, unsigned long long *matches) {
+    RegionResult r = {0, 0, 0};
+    size_t next[MAX_PATTERNS]; /* next occurrence of each pattern at or after 'cursor' */
+    for (int i = 0; i < q->n_include; i++) {
+        next[i] = UNKNOWN;
+    }
+    size_t cursor = 0;                   /* start of the first line not handled yet */
+    unsigned long long lines_before = 0; /* lines before 'cursor' */
+
+    while (cursor < size) {
+        size_t best = NOT_FOUND;
+        for (int i = 0; i < q->n_include; i++) {
+            if (next[i] == NOT_FOUND) {
+                continue; /* this pattern does not occur any more */
+            }
+            if (next[i] == UNKNOWN || next[i] < cursor) {
+                next[i] = pattern_find_fast(&q->include[i], data, size, cursor);
+            }
+            if (next[i] < best) {
+                best = next[i];
+            }
+        }
+        if (best == NOT_FOUND) {
+            break;
+        }
+
+        size_t ls = best; /* start of the line that holds the occurrence */
+        while (ls > cursor && data[ls - 1] != '\n') {
+            ls--;
+        }
+        lines_before += count_newlines(data + cursor, ls - cursor);
+        const unsigned char *nl = memchr(data + best, '\n', size - best);
+        size_t le = nl ? (size_t)(nl - data) : size;
+        size_t len = le - ls;
+        while (len > 0 && data[ls + len - 1] == '\r') { /* CRLF, like Python's rstrip */
+            len--;
+        }
+
+        int stop = handle_line(q, first_line_no + lines_before, data + ls, len, matches);
+        lines_before++;
+        cursor = nl ? le + 1 : size;
+        if (stop) {
+            r.lines = lines_before;
+            r.consumed = cursor;
+            r.stop = 1;
+            return r;
+        }
+    }
+
+    if (cursor < size) { /* the rest has no more matches: just count its lines */
+        lines_before += count_newlines(data + cursor, size - cursor);
+        if (data[size - 1] != '\n') {
+            lines_before++;
+        }
+    }
+    r.lines = lines_before;
+    r.consumed = size;
+    return r;
+}
+
+/* Same as scan_region but visits every line. It is faster when a large share of
+ * the lines match, because then jumping from match to match saves nothing. */
+static RegionResult scan_region_lines(Query *q, const unsigned char *data, size_t size,
+                                      unsigned long long first_line_no, unsigned long long *matches) {
+    RegionResult r = {0, 0, 0};
+    size_t start = 0;
+    unsigned long long lines_before = 0;
+
+    while (start < size) {
+        const unsigned char *nl = memchr(data + start, '\n', size - start);
+        size_t end = nl ? (size_t)(nl - data) : size;
+        size_t len = end - start;
+        while (len > 0 && data[start + len - 1] == '\r') { /* CRLF, like Python's rstrip */
+            len--;
+        }
+        int stop = handle_line(q, first_line_no + lines_before, data + start, len, matches);
+        lines_before++;
+        start = nl ? end + 1 : size;
+        if (stop) {
+            r.lines = lines_before;
+            r.consumed = start;
+            r.stop = 1;
+            return r;
+        }
+    }
+    r.lines = lines_before;
+    r.consumed = size;
+    return r;
+}
+
+/* Searches a whole mapped file, one chunk (ending at a line end) at a time, so
+ * that the first results appear quickly even in huge files. Each chunk is
+ * searched in the way that suits the density of matches seen in the previous
+ * one: jumping between matches when they are sparse, line by line when more
+ * than a third of the lines match. */
+static void scan_mapped(Query *q, const unsigned char *data, size_t size,
+                        unsigned long long *lines_out, unsigned long long *consumed_out,
+                        unsigned long long *matches_out) {
+    unsigned long long lines = 0, matches = 0;
+    size_t pos = 0, consumed = 0;
+    int stop = 0;
+    int dense = 0; /* the previous chunk had many matches */
+
+    unsigned long long freq[256] = {0}; /* byte frequencies in the first 1 MiB */
+    size_t sample = size < ((size_t)1 << 20) ? size : ((size_t)1 << 20);
+    for (size_t i = 0; i < sample; i++) {
+        freq[data[i]]++;
+    }
+    for (int i = 0; i < q->n_include; i++) {
+        pattern_pick_rare(&q->include[i], freq);
+    }
+
+    while (!stop && pos < size) {
+        size_t end = size - pos > MAP_CHUNK ? pos + MAP_CHUNK : size;
+        if (end < size) { /* move the end to the end of its line */
+            const unsigned char *nl = memchr(data + end - 1, '\n', size - (end - 1));
+            end = nl ? (size_t)(nl - data) + 1 : size;
+        }
+        unsigned long long matches_before = matches;
+        RegionResult r = dense ? scan_region_lines(q, data + pos, end - pos, lines + 1, &matches)
+                               : scan_region(q, data + pos, end - pos, lines + 1, &matches);
+        dense = r.lines > 0 && (matches - matches_before) * 3 > r.lines;
+        lines += r.lines;
+        consumed = pos + r.consumed;
+        stop = r.stop;
+        pos = end;
+    }
+    if (!stop) {
+        consumed = size;
+    }
+    *lines_out = lines;
+    *consumed_out = consumed;
+    *matches_out = matches;
+}
+
 static void usage(void) {
-    fputs("Usage: log_searcher [-i] [-c] [-m N] [-x EXCLUDE]... [-l LEVEL=WORD,WORD]... "
+    fputs("Usage: log_searcher [-i] [-c] [-B] [-m N] [-x EXCLUDE]... [-l LEVEL=WORD,WORD]... "
           "[-o OUTFILE -F txt|csv|json [-s SEVERITY]] -e PATTERN [-e PATTERN]... FILE\n",
           stderr);
 }
@@ -488,6 +887,8 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0) {
             ignore_case = 1;
+        } else if (strcmp(argv[i], "-B") == 0) {
+            q->no_mmap = 1;
         } else if (strcmp(argv[i], "-c") == 0) {
             q->count_only = 1;
         } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -546,6 +947,13 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    for (int i = 0; i < q->n_include; i++) { /* a match cannot span two lines */
+        if (strchr(include_args[i], '\n')) {
+            fputs("Error: patterns cannot contain a newline.\n", stderr);
+            return 2;
+        }
+    }
+
     init_tables();
     const unsigned char *fold = ignore_case ? fold_lower : fold_exact;
     int n_include = q->n_include, n_exclude = q->n_exclude;
@@ -590,70 +998,14 @@ int main(int argc, char **argv) {
 #endif
     setvbuf(stdout, NULL, _IOFBF, 1u << 16);
 
-    size_t cap = BLOCK_SIZE;
-    size_t have = 0; /* bytes currently held in buf */
-    unsigned char *buf = malloc(cap);
-    if (!buf) {
-        fputs("Error: out of memory.\n", stderr);
+    unsigned long long line_no = 0, matches = 0, consumed = 0;
+    MappedFile map;
+    if (!q->no_mmap && map_open(path, &map) == 0) {
+        scan_mapped(q, map.data, map.size, &line_no, &consumed, &matches);
+        map_close(&map);
+    } else if (scan_buffered(q, f, &line_no, &consumed, &matches) != 0) {
         fclose(f);
         return 2;
-    }
-
-    unsigned long long line_no = 0, matches = 0, consumed = 0;
-    int stop = 0;
-
-    while (!stop) {
-        if (have == cap) { /* a single line is longer than the buffer: grow it */
-            cap *= 2;
-            unsigned char *bigger = realloc(buf, cap);
-            if (!bigger) {
-                fputs("Error: out of memory (line too long).\n", stderr);
-                free(buf);
-                fclose(f);
-                return 2;
-            }
-            buf = bigger;
-        }
-        size_t got = fread(buf + have, 1, cap - have, f);
-        if (got == 0) {
-            break; /* end of file */
-        }
-        have += got;
-
-        size_t start = 0;
-        for (;;) {
-            unsigned char *nl = memchr(buf + start, '\n', have - start);
-            if (!nl) {
-                break;
-            }
-            size_t len = (size_t)(nl - (buf + start));
-            consumed += len + 1;
-            while (len > 0 && buf[start + len - 1] == '\r') { /* CRLF, like Python's rstrip */
-                len--;
-            }
-            line_no++;
-            if (handle_line(q, line_no, buf + start, len, &matches)) {
-                stop = 1;
-                break;
-            }
-            start = (size_t)(nl - buf) + 1;
-        }
-
-        if (!stop) { /* keep the incomplete last line for the next block */
-            memmove(buf, buf + start, have - start);
-            have -= start;
-        }
-    }
-
-    /* Last line of the file when it has no trailing newline. */
-    if (!stop && have > 0) {
-        size_t len = have;
-        consumed += len;
-        while (len > 0 && buf[len - 1] == '\r') {
-            len--;
-        }
-        line_no++;
-        handle_line(q, line_no, buf, len, &matches);
     }
 
     int export_failed = 0;
@@ -677,7 +1029,6 @@ int main(int argc, char **argv) {
     }
     fputc('\n', stderr);
 
-    free(buf);
     fclose(f);
     if (export_failed) {
         fputs("Error: could not write the export file.\n", stderr);
