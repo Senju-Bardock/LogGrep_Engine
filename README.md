@@ -40,7 +40,7 @@ A command-line utility designed to search for patterns, regular expressions, and
 
 ### 27/10/2026
 
-- imported mmap. Now, it maps the file using `mmap` on Linux and `CreateFileMapping`/`MapViewOfFile` on Windows. If that is not possible (e.g., an empty file or a pipe), it reads in blocks as before, yielding the same results.
+- Imported mmap. Now, it maps the file using `mmap` on Linux and `CreateFileMapping`/`MapViewOfFile` on Windows. If that is not possible (e.g., an empty file or a pipe), it reads in blocks as before, yielding the same results.
 - The code searches for the pattern within the raw bytes, jumping from one match to the next rather than scanning every line. To locate the pattern, it uses its rarest byte in conjunction with `memchr`. When the `-i` flag is used, it proceeds with the aforementioned algorithm.
 - As for line counting, it processes the data in 8-byte chunks, without calling `memchr` for each individual line.
 - If more than a third of the lines in a block match, the next block is processed line by line, because skipping between matches no longer offers any savings.
