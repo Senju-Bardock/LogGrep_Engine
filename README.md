@@ -10,6 +10,8 @@ A command-line utility designed to search for patterns, regular expressions, and
 
 -- Profile Management via JSON (queries.json): Enables the storage of complex filter sets, frequently used regular expressions, and categorization rules (e.g., automatically classifying critical errors as ERROR, warnings as WARN, and debug events as DEBUG).
 
+## Progress log:
+
 ### 20/10/2026
 
 - made pure python code to do tests
