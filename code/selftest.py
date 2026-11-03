@@ -13,10 +13,12 @@ Usage (log_searcher must be built first):
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -123,6 +125,70 @@ def check_chunk_boundaries(tmp, log):
     return checks, failures
 
 
+def random_regex(rnd):
+    """A random regular expression made of the constructs the C engine supports
+    (plus a few it does not, which must be refused rather than mis-handled)."""
+    def atom(depth):
+        k = rnd.random()
+        if k < 0.35:
+            return rnd.choice(list("abAB01_x"))
+        if k < 0.43:
+            return "."
+        if k < 0.58:
+            body = "".join(rnd.choice(["a", "b", "0-9", "A-C", r"\d", r"\w", r"\s", "_", " ", r"\."]) for _ in range(rnd.randint(1, 3)))
+            return "[" + ("^" if rnd.random() < 0.3 else "") + body + "]"
+        if k < 0.68:
+            return rnd.choice([r"\d", r"\w", r"\s", r"\D", r"\W", r"\S", r"\."])
+        if k < 0.78:
+            return rnd.choice([r"\b", "^", "$", r"\B"])
+        if depth > 0:
+            return rnd.choice(["(", "(?:", "(?P<g>"]) + alt(depth - 1) + ")"
+        return "a"
+
+    def concat(depth):
+        out = ""
+        for _ in range(rnd.randint(1, 4)):
+            out += atom(depth) + rnd.choice(["", "", "", "*", "+", "?", "{2}", "{1,3}", "{,2}", "{2,}", "*?", "+?"])
+        return out
+
+    def alt(depth):
+        return "|".join(concat(depth) for _ in range(rnd.choice([1, 1, 2, 3])))
+
+    return alt(rnd.choice([0, 1, 2]))
+
+
+def check_regex_differential(tmp, count=200):
+    """Compares the C regex engine with Python's re on random expressions and
+    random lines. Expressions the C engine refuses (exit code 3) are skipped.
+    Returns (checks, failures)."""
+    binary = loggrep.find_c_binary()
+    rnd = random.Random(99)
+    path = tmp / "regex_lines.log"
+    checks = failures = 0
+    warnings.simplefilter("ignore")
+    for _ in range(count):
+        pattern, icase = random_regex(rnd), rnd.random() < 0.3
+        lines = []
+        for _ in range(rnd.randint(1, 40)):
+            text = "".join(rnd.choice("abAB01_ -.,x") for _ in range(rnd.randint(0, 12)))
+            lines.append(text.encode() + (b"\r" if rnd.random() < 0.1 else b""))
+        try:
+            compiled = re.compile(pattern.encode(), re.IGNORECASE if icase else 0)
+        except re.error:
+            continue
+        path.write_bytes(b"".join(line + b"\n" for line in lines))
+        proc = subprocess.run([binary] + (["-i"] if icase else []) + ["-r", pattern, str(path)], capture_output=True)
+        if proc.returncode == 3:
+            continue
+        checks += 1
+        got = {int(row.split(b"|", 1)[0]) for row in proc.stdout.split(b"\n") if row}
+        want = {i for i, line in enumerate(lines, 1) if compiled.search(line.rstrip(b"\r\n"))}
+        if got != want:
+            failures += 1
+            print(f"FAIL  regex differs from Python's re: {pattern!r}{' (ignore case)' if icase else ''}")
+    return checks, failures
+
+
 def main():
     if not loggrep.find_c_binary():
         sys.exit("log_searcher not found. Build it first: "
@@ -142,6 +208,13 @@ def main():
             "exclude": ["-e", "TESTLINE", "-x", "EXCLUDEME"],
             "max matches": ["-e", "TESTLINE", "-m", "50"],
             "no matches": ["-e", "THIS_NEVER_APPEARS"],
+            "regex alternation": ["-r", "ERROR|WARN"],
+            "regex anchors and word boundary": ["-r", r"^TESTLINE .*\bERROR\b"],
+            "regex end anchor (CRLF lines)": ["-r", "message$"],
+            "regex classes and counts": ["-r", r"[0-9]{1,3}\.[A-Za-z]+", "-r", "ab{2,}c?"],
+            "regex ignore case": ["-r", "testline [a-z]+ error", "-i"],
+            "regex and literal together": ["-e", "boom", "-r", r"\bINFO\b", "-x", "EXCLUDEME"],
+            "regex with severity fallback": ["-p", "t", "-r", "lowercase|plain"],
         }
         for name, extra in cases.items():
             # console output and summary (line mode, then count-only mode)
@@ -165,7 +238,17 @@ def main():
                     print(f"FAIL  {name} [export .{kind}]: files differ ({len(a)} vs {len(b)} bytes)")
                 elif kind == "json":
                     json.loads(a.decode("utf-8"))  # must also be valid JSON
+        # an expression the C engine cannot handle must silently run in Python
+        for flags in ([], ["--count"]):
+            fallback = ["-r", r"(?<=TESTLINE )plain", "-r", r"(\w)\1"]
+            checks += 1
+            if run("auto", log, queries, fallback + flags) != run("python", log, queries, fallback + flags):
+                failures += 1
+                print("FAIL  unsupported regex: automatic fallback to Python gives different results")
         extra_checks, extra_failures = check_chunk_boundaries(tmp, log)
+        checks += extra_checks
+        failures += extra_failures
+        extra_checks, extra_failures = check_regex_differential(tmp)
         checks += extra_checks
         failures += extra_failures
         print(f"{checks - failures}/{checks} checks passed")

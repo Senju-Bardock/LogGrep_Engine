@@ -10,8 +10,10 @@ Quick usage:
 
 Uses only the standard library. The search engine is a swappable function
 (see ENGINES). The C engine (log_searcher) is used automatically when its
-binary is next to this script or in the PATH and the search is literal-only;
-regular expressions always run in the Python engine.
+binary is next to this script or in the PATH. Regular expressions run in C too
+when they only use the common syntax (groups, classes, alternation, quantifiers,
+anchors, \\d \\w \\s \\b); anything else (lookaround, backreferences, inline
+flags...) is searched by the Python engine.
 """
 
 import argparse
@@ -118,8 +120,8 @@ def search_python(path, matcher, stats, max_matches=0, levels=None, count_only=F
     with open(path, "rb") as f:
         try:
             for n, line in enumerate(f, 1):
-                if include(line) and not (exclude and exclude(line)):
-                    text = line.rstrip(b"\r\n")
+                text = line.rstrip(b"\r\n")  # match the line content, not its line ending
+                if include(text) and not (exclude and exclude(text)):
                     yield n, text, classify(text, level_regexes)
         finally:
             stats.lines = n
@@ -160,16 +162,32 @@ def c_levels_supported(levels):
     return True
 
 
+def c_regex_problem(matcher):
+    """Asks log_searcher whether it supports these regular expressions.
+    Returns None if it does, or the reason if it does not."""
+    binary = find_c_binary()
+    cmd = [binary, "-k"] + (["-i"] if matcher.ignore_case else [])
+    for text in matcher.regexes:
+        cmd += ["-r", text]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode == 0:
+        return None
+    reason = proc.stderr.decode("utf-8", errors="replace").strip()
+    return reason.replace("Error: unsupported regular expression: ", "").rstrip(".") or "unsupported regular expression"
+
+
 def c_unsupported_reason(matcher, levels, paths=()):
     """Returns why the C engine cannot run this search, or None if it can."""
-    if matcher.regexes:
-        return "the C engine only supports literal patterns, not regular expressions"
-    if len(matcher.literals) > C_MAX_PATTERNS or len(matcher.excludes) > C_MAX_PATTERNS:
+    if len(matcher.literals) + len(matcher.regexes) > C_MAX_PATTERNS or len(matcher.excludes) > C_MAX_PATTERNS:
         return f"the C engine accepts at most {C_MAX_PATTERNS} patterns of each kind"
-    if not all(t.isascii() for t in matcher.literals + matcher.excludes):
+    if not all(t.isascii() for t in matcher.literals + matcher.regexes + matcher.excludes):
         return "the C engine only supports ASCII patterns"
     if any(ch in t for t in matcher.literals + matcher.excludes for ch in "\r\n"):
         return "the C engine does not support patterns with line breaks"
+    if matcher.regexes and find_c_binary():
+        problem = c_regex_problem(matcher)
+        if problem:
+            return f"regular expression not supported by the C engine ({problem})"
     if not all(p.isascii() for p in paths):
         return "the C engine only supports ASCII file paths"
     if not c_levels_supported(levels):
@@ -210,6 +228,8 @@ def search_c(path, matcher, stats, max_matches=0, levels=None, count_only=False,
             cmd += ["-s", severity]
     for text in matcher.literals:
         cmd += ["-e", text]
+    for text in matcher.regexes:
+        cmd += ["-r", text]
     for text in matcher.excludes:
         cmd += ["-x", text]
     cmd.append(str(path))
