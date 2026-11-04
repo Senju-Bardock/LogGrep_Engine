@@ -72,7 +72,41 @@ A command-line utility designed to search for patterns, regular expressions, and
 
 #### Speed ​​(5M lines, 393 MB, end-to-end, count mode):
 
-- Search: -p ips ((\d{1,3}\.){3}\d{1,3}) --> Python: 36.7s | C --> 2.2s (about 16×)
-- Search: -p errors (literals) -->  Python: 5.8s | C --> 0.33s
+
+| Search | Python | C |
+| :--- | :--- | :--- |
+| `-p ips ((\d{1,3}\.){3}\d{1,3})` | 36.7 s | 2.2 s (about 16×) |
+| `-p errors (literals)` | 5.8 s | 0.33 s |
 
 -- Comments: Regex in C reaches around 300 MB/s—well below the 3.4 GB/s achieved when searching for an uncommon literal—because it processes every line rather than jumping between matches. The next step with the most potential is to speed up the regexes by extracting a mandatory literal from each expression (for example, "Failed password"), allowing the process to jump directly to candidate lines via a "fast path." With regexes that include such literals—for instance, "Failed password|Invalid user"—performance should approach the speed of literal-based matching.
+
+### 04/11/2026
+
+- Regexes with fixed text are now 5 to 10 times faster.
+- Improved the level classification.
+- Two files are changed: `log_searcher.c` (version 0.6) and `selftest.py`. `loggrep.py` remains unchanged.
+- Literal pre-filtering (the main improvement): the fixed text that must necessarily appear is extracted from each expression. For example, `Failed password|Invalid user` searches for those two phrases using a fast-path method, and the automaton only examines the candidate lines. With `^2026.*\bERROR\b`, it searches for `ERROR`, and with `ERR(OR)?: \w+`, it searches for `ERROR:` and `ERR:`. If the expression lacks any useful fixed text (at least 3 characters long—for instance, in `(\d{1,3}\.){3}\d{1,3}`), it continues to scan all lines, just as before.
+- Faster level classification: previously, this accounted for 70% of the processing time for profiles with many matches. Now, it traverses the string just once, checking only those positions where a level-based word can begin. As a side effect, it behaves exactly like Python’s `\b` anchor, even for words that start or end with symbols.
+- Discarded: I tried classifying using an automaton and compressing the tables by byte classes. Neither approach provided any speedup (the second one was actually slower), so I removed them.
+
+#### Times in my environment (393 MB, counting mode, with active levels, best of 3):
+
+
+| Search | Before | Now |
+| :--- | :--- | :--- |
+| `-r "Failed password\|Invalid user"` | ~1.3 s | 0.23 s |
+| `-r "^2026.*\bERROR\b"` | ~1.2 s | 0.23 s |
+| `-r "timeout\|unauthori[sz]ed\|connection lost"` | ~1.3 s | 0.33 s |
+| rare regex (`RARE_NEEDLE_[0-9]`) | 1.2 s | 0.12 s |
+| `-p ips` (no fixed text) | ~1.9 s | ~1.75 s |
+| literal `Request` (49% of lines) | ~0.9 s | 0.68 s |
+
+> Via the CLI, using -r "Failed password|Invalid user" reduces the time from 6.0 s in Python to 0.32 s in C (1.2 GB/s). My own 1.11s on Windows just dropped to something close to 0.3s.
+
+#### Checks:
+
+- Python regex: over 5,000 expressions constructed using words (ensuring that nearly all have a pre-filter), with not a single discrepancy and no instance where a searched-for string is missing from a matching line. Also includes tiny code blocks and memory sanitizers.
+- All reading modes: 5,400 comparisons—covering block-based reading, mapping, and 1-byte or 64-byte blocks, with support for literals, regex, nesting levels, and exports—showed no differences.
+- selftest.py: there are now 416 checks, including 22 complex, hand-crafted expressions (involving optional elements, {0,n} quantifiers, empty branches, etc.). I intentionally broke the literal-parsing logic five times: the self-test detected four of these instances, while the fifth proved harmless by design (the engine continues to function correctly even if that specific failure occurs).
+
+-- Comments: -p ips remains at around 200 MB/s, because the bottleneck is the automaton itself, processing byte by byte. So it stays without fixed text. With -i: the pre-filter uses a slow search method, so using -i with a regex offers little gain (1.3 s vs. 1.1 s). These are things I didn't improve, wasn't actually worth it.
