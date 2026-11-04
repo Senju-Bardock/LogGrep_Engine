@@ -88,6 +88,7 @@ A command-line utility designed to search for patterns, regular expressions, and
 - Literal pre-filtering (the main improvement): the fixed text that must necessarily appear is extracted from each expression. For example, `Failed password|Invalid user` searches for those two phrases using a fast-path method, and the automaton only examines the candidate lines. With `^2026.*\bERROR\b`, it searches for `ERROR`, and with `ERR(OR)?: \w+`, it searches for `ERROR:` and `ERR:`. If the expression lacks any useful fixed text (at least 3 characters long—for instance, in `(\d{1,3}\.){3}\d{1,3}`), it continues to scan all lines, just as before.
 - Faster level classification: previously, this accounted for 70% of the processing time for profiles with many matches. Now, it traverses the string just once, checking only those positions where a level-based word can begin. As a side effect, it behaves exactly like Python’s `\b` anchor, even for words that start or end with symbols.
 - Discarded: I tried classifying using an automaton and compressing the tables by byte classes. Neither approach provided any speedup (the second one was actually slower), so I removed them.
+- `selftest.py` now passes 416/416 checks. 2.20105820106 ~ 2.20 times more than before.
 
 #### Times in my environment (393 MB, counting mode, with active levels, best of 3):
 
