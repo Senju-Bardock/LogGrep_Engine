@@ -125,11 +125,16 @@ def check_chunk_boundaries(tmp, log):
     return checks, failures
 
 
+WORDS = ["Failed", "password", "ERROR", "warn", "abc", "user", "Invalid", "KeyError", "ab", "x1"]
+
+
 def random_regex(rnd):
     """A random regular expression made of the constructs the C engine supports
     (plus a few it does not, which must be refused rather than mis-handled)."""
     def atom(depth):
         k = rnd.random()
+        if k < 0.20:
+            return rnd.choice(WORDS)  # fixed text: the C engine searches for it before running the regex
         if k < 0.35:
             return rnd.choice(list("abAB01_x"))
         if k < 0.43:
@@ -157,9 +162,11 @@ def random_regex(rnd):
     return alt(rnd.choice([0, 1, 2]))
 
 
-def check_regex_differential(tmp, count=200):
+def check_regex_differential(tmp, count=300):
     """Compares the C regex engine with Python's re on random expressions and
-    random lines. Expressions the C engine refuses (exit code 3) are skipped.
+    random lines, and checks that the fixed strings it searches for first
+    (printed by -k) really occur in every line the expression matches.
+    Expressions the C engine refuses (exit code 3) are skipped.
     Returns (checks, failures)."""
     binary = loggrep.find_c_binary()
     rnd = random.Random(99)
@@ -170,14 +177,16 @@ def check_regex_differential(tmp, count=200):
         pattern, icase = random_regex(rnd), rnd.random() < 0.3
         lines = []
         for _ in range(rnd.randint(1, 40)):
-            text = "".join(rnd.choice("abAB01_ -.,x") for _ in range(rnd.randint(0, 12)))
+            pieces = list("abAB01_ -.,x") + WORDS + [" "]
+            text = "".join(rnd.choice(pieces) for _ in range(rnd.randint(0, 8)))
             lines.append(text.encode() + (b"\r" if rnd.random() < 0.1 else b""))
         try:
             compiled = re.compile(pattern.encode(), re.IGNORECASE if icase else 0)
         except re.error:
             continue
         path.write_bytes(b"".join(line + b"\n" for line in lines))
-        proc = subprocess.run([binary] + (["-i"] if icase else []) + ["-r", pattern, str(path)], capture_output=True)
+        flags = ["-i"] if icase else []
+        proc = subprocess.run([binary] + flags + ["-r", pattern, str(path)], capture_output=True)
         if proc.returncode == 3:
             continue
         checks += 1
@@ -186,6 +195,68 @@ def check_regex_differential(tmp, count=200):
         if got != want:
             failures += 1
             print(f"FAIL  regex differs from Python's re: {pattern!r}{' (ignore case)' if icase else ''}")
+        probe = subprocess.run([binary, "-k"] + flags + ["-r", pattern], capture_output=True)
+        required = [bytes.fromhex(row.split()[1]) for row in probe.stderr.decode().splitlines() if row.startswith("#prefilter ")]
+        if required:
+            checks += 1
+            for i in want:
+                text = lines[i - 1].rstrip(b"\r\n")
+                text = text.lower() if icase else text
+                if not any(item in text for item in required):
+                    failures += 1
+                    print(f"FAIL  searched strings {required} missing from a line matched by {pattern!r}")
+                    break
+    return checks, failures
+
+
+PREFILTER_CASES = [
+    "Failed password|Invalid user", "(?:Failed )?password", "Fail(ed)?", "(?:abc)?def", "ab{0,2}cde",
+    "(?:abc){0,2}xyz", "(?:abc)*xyz", "(abc|)def", "abc+d", "(?:abc){1,2}d", "a(bc)?d", "KeyError|Key",
+    "(KeyError|ERROR)?x1", "(?:^|[ ])ERROR(?: |$)", "Fail.*password", "pass(word)?[0-9]*", "[Ww]arn|WARN",
+    "unau?thori[sz]ed", "(?:ab|cd){2}ef", "x{0}abc", "(abc){,2}d", "^(?:ERROR|WARN)x1$",
+    "Failed|[0-9]+", "ERROR|a.c|zzz", "(?:Fail|\\w+)ed", "abc|^$", "(?:Failed|)password",
+]
+
+
+def check_prefilter_cases(tmp):
+    """Hand-picked expressions where the fixed text that must be present is easy
+    to get wrong (optional parts, {0,n} repeats, empty alternatives...). For each
+    one, compares the C engine with Python's re and checks that the strings it
+    searches for first occur in every matching line. Returns (checks, failures)."""
+    binary = loggrep.find_c_binary()
+    rnd = random.Random(7)
+    pieces = ["Failed password", "password", "Fail", "Failed", "abc", "abcdef", "def", "xyz", "abcabcxyz", "abbcde",
+              "acde", "abcde", "abcd", "KeyError", "Key", "ERROR x1", "x1", "ERROR", "WARN", "warn", "Warn",
+              "unathorized", "unauthorized", "unauthorised", "Invalid user", "pass", "pass12", "ab", "cdcdef", " ", ""]
+    lines = [piece.encode() for piece in pieces]
+    lines += [b"".join(rnd.choice(pieces).encode() + rnd.choice([b"", b" "]) for _ in range(rnd.randint(1, 4))) for _ in range(150)]
+    path = tmp / "prefilter_cases.log"
+    path.write_bytes(b"".join(line + b"\n" for line in lines))
+    checks = failures = 0
+    for pattern in PREFILTER_CASES:
+        for icase in (False, True):
+            flags = ["-i"] if icase else []
+            compiled = re.compile(pattern.encode(), re.IGNORECASE if icase else 0)
+            want = {i for i, line in enumerate(lines, 1) if compiled.search(line)}
+            proc = subprocess.run([binary] + flags + ["-r", pattern, str(path)], capture_output=True)
+            checks += 1
+            if proc.returncode == 3:
+                failures += 1
+                print(f"FAIL  {pattern!r} is refused by the C engine")
+                continue
+            got = {int(row.split(b"|", 1)[0]) for row in proc.stdout.split(b"\n") if row}
+            if got != want:
+                failures += 1
+                print(f"FAIL  {pattern!r}{' (ignore case)' if icase else ''}: different lines than Python's re")
+            probe = subprocess.run([binary, "-k"] + flags + ["-r", pattern], capture_output=True)
+            required = [bytes.fromhex(row.split()[1]) for row in probe.stderr.decode().splitlines() if row.startswith("#prefilter ")]
+            checks += 1
+            for i in want:
+                text = lines[i - 1].lower() if icase else lines[i - 1]
+                if required and not any(item in text for item in required):
+                    failures += 1
+                    print(f"FAIL  {pattern!r}: searched strings {required} missing from a matching line")
+                    break
     return checks, failures
 
 
@@ -246,6 +317,9 @@ def main():
                 failures += 1
                 print("FAIL  unsupported regex: automatic fallback to Python gives different results")
         extra_checks, extra_failures = check_chunk_boundaries(tmp, log)
+        checks += extra_checks
+        failures += extra_failures
+        extra_checks, extra_failures = check_prefilter_cases(tmp)
         checks += extra_checks
         failures += extra_failures
         extra_checks, extra_failures = check_regex_differential(tmp)

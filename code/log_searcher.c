@@ -1,5 +1,5 @@
 /*
- * log_searcher.c - LogGrep search engine, version 0.5
+ * log_searcher.c - LogGrep search engine, version 0.6
  *
  * Searches a log file for literal patterns (Boyer-Moore-Horspool, with a
  * memchr prefilter) and regular expressions (a lazily built DFA) and prints
@@ -799,6 +799,258 @@ static void re_emit(const ReParser *p, Prog *pr, int node) {
     }
 }
 
+/* ---- Required literals --------------------------------------------------- */
+
+/* Most useful regular expressions contain some fixed text that every match
+ * must include, e.g. "Failed password" in "Failed password|Invalid user" or
+ * "ERROR" in "^\d+ ERROR .*". lit_info() works out, for every part of the
+ * expression, either the exact set of strings it can match or a set of strings
+ * of which at least one must appear in anything it matches. The search then
+ * looks for those strings with the fast literal search and only runs the DFA
+ * on the lines that contain one. With -i the strings are lower-cased and are
+ * compared case-insensitively. The sets are always a superset of the truth, so
+ * no matching line is ever skipped. */
+
+#define LIT_MAX 12        /* strings per set */
+#define LIT_LEN 32        /* longest string kept */
+#define LIT_MIN_USEFUL 3  /* shorter strings are too common to be worth it */
+#define LIT_DEPTH 24      /* deeper parts of the expression are not analysed */
+
+typedef struct {
+    int n;
+    int len[LIT_MAX];
+    unsigned char s[LIT_MAX][LIT_LEN];
+} LitSet;
+
+typedef struct {
+    int exact;   /* the part can only match the strings in 'ex' */
+    LitSet ex;
+    LitSet must; /* otherwise: a match contains one of these (n == 0: unknown) */
+} LitInfo;
+
+static int lit_add(LitSet *set, const unsigned char *str, int len) {
+    if (len > LIT_LEN) {
+        return 0;
+    }
+    for (int i = 0; i < set->n; i++) {
+        if (set->len[i] == len && memcmp(set->s[i], str, (size_t)len) == 0) {
+            return 1;
+        }
+    }
+    if (set->n == LIT_MAX) {
+        return 0;
+    }
+    memcpy(set->s[set->n], str, (size_t)len);
+    set->len[set->n] = len;
+    set->n++;
+    return 1;
+}
+
+static int lit_has_empty(const LitSet *set) {
+    for (int i = 0; i < set->n; i++) {
+        if (set->len[i] == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* out = every concatenation of a string of a with a string of b. 0 if it does not fit. */
+static int lit_product(const LitSet *a, const LitSet *b, LitSet *out) {
+    out->n = 0;
+    for (int i = 0; i < a->n; i++) {
+        for (int j = 0; j < b->n; j++) {
+            unsigned char buf[2 * LIT_LEN];
+            int len = a->len[i] + b->len[j];
+            if (len > LIT_LEN) {
+                return 0;
+            }
+            memcpy(buf, a->s[i], (size_t)a->len[i]);
+            memcpy(buf + a->len[i], b->s[j], (size_t)b->len[j]);
+            if (!lit_add(out, buf, len)) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static int lit_union(LitSet *dst, const LitSet *src) {
+    for (int i = 0; i < src->n; i++) {
+        if (!lit_add(dst, src->s[i], src->len[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* The strings of which one must appear in any match of this part, or NULL. */
+static const LitSet *lit_usable(const LitInfo *info) {
+    if (info->exact) {
+        return lit_has_empty(&info->ex) ? NULL : &info->ex;
+    }
+    return info->must.n ? &info->must : NULL;
+}
+
+/* Keeps the best candidate: the one whose shortest string is longest. */
+static void lit_consider(LitSet *best, int *best_score, const LitSet *candidate) {
+    if (!candidate || candidate->n == 0 || lit_has_empty(candidate)) {
+        return;
+    }
+    int shortest = LIT_LEN + 1;
+    for (int i = 0; i < candidate->n; i++) {
+        if (candidate->len[i] < shortest) {
+            shortest = candidate->len[i];
+        }
+    }
+    int score = shortest * 100 - candidate->n;
+    if (score > *best_score) {
+        *best = *candidate;
+        *best_score = score;
+    }
+}
+
+static void lit_info(const ReParser *p, int node, int icase, int depth, LitInfo *out) {
+    memset(out, 0, sizeof *out);
+    if (depth > LIT_DEPTH) {
+        return; /* no information: always safe */
+    }
+    const Node *nd = &p->nodes[node];
+    switch (nd->type) {
+    case N_EMPTY:
+    case N_ASSERT: /* zero width: it only restricts, so the empty string is a superset */
+        out->exact = 1;
+        lit_add(&out->ex, (const unsigned char *)"", 0);
+        break;
+    case N_SET: {
+        unsigned char seen[256] = {0}, folded[5];
+        int count = 0;
+        for (unsigned b = 0; b < 256; b++) {
+            if (!set_has(&p->sets[nd->a], b)) {
+                continue;
+            }
+            unsigned char f = (unsigned char)(icase ? tolower((int)b) : (int)b);
+            if (!seen[f]) {
+                seen[f] = 1;
+                if (count < 5) {
+                    folded[count] = f;
+                }
+                count++;
+            }
+        }
+        if (count >= 1 && count <= 4) {
+            out->exact = 1;
+            for (int i = 0; i < count; i++) {
+                lit_add(&out->ex, &folded[i], 1);
+            }
+        }
+        break;
+    }
+    case N_CAT: {
+        LitSet acc, best;
+        int best_score = -1, whole_exact = 1;
+        acc.n = 0;
+        lit_add(&acc, (const unsigned char *)"", 0);
+        best.n = 0;
+        for (int child = nd->a; child >= 0; child = p->nodes[child].next) {
+            LitInfo ci;
+            lit_info(p, child, icase, depth + 1, &ci);
+            if (ci.exact) {
+                LitSet product;
+                if (lit_product(&acc, &ci.ex, &product)) {
+                    acc = product;
+                } else { /* too many or too long: keep what we have and start again */
+                    whole_exact = 0;
+                    lit_consider(&best, &best_score, &acc);
+                    acc = ci.ex;
+                }
+            } else {
+                whole_exact = 0;
+                lit_consider(&best, &best_score, &acc);
+                acc.n = 0;
+                lit_add(&acc, (const unsigned char *)"", 0);
+                lit_consider(&best, &best_score, ci.must.n ? &ci.must : NULL);
+            }
+        }
+        if (whole_exact) {
+            out->exact = 1;
+            out->ex = acc;
+        } else {
+            lit_consider(&best, &best_score, &acc);
+            out->must = best;
+        }
+        break;
+    }
+    case N_ALT: {
+        LitSet exact_union, must_union;
+        int all_exact = 1, must_ok = 1;
+        exact_union.n = 0;
+        must_union.n = 0;
+        for (int child = nd->a; child >= 0; child = p->nodes[child].next) {
+            LitInfo ci;
+            lit_info(p, child, icase, depth + 1, &ci);
+            if (all_exact && (!ci.exact || !lit_union(&exact_union, &ci.ex))) {
+                all_exact = 0;
+            }
+            const LitSet *usable = lit_usable(&ci);
+            if (must_ok && (!usable || !lit_union(&must_union, usable))) {
+                must_ok = 0;
+            }
+        }
+        if (all_exact) {
+            out->exact = 1;
+            out->ex = exact_union;
+        } else if (must_ok) {
+            out->must = must_union;
+        }
+        break;
+    }
+    case N_QUEST: {
+        LitInfo ci;
+        lit_info(p, nd->a, icase, depth + 1, &ci);
+        if (ci.exact) { /* the child, or nothing */
+            out->exact = 1;
+            out->ex = ci.ex;
+            if (!lit_add(&out->ex, (const unsigned char *)"", 0)) {
+                out->exact = 0;
+            }
+        }
+        break;
+    }
+    case N_PLUS:
+    case N_REPEAT:
+        if (nd->type == N_PLUS || nd->min >= 1) { /* at least one copy of the child is there */
+            LitInfo ci;
+            lit_info(p, nd->a, icase, depth + 1, &ci);
+            const LitSet *usable = lit_usable(&ci);
+            if (usable) {
+                out->must = *usable;
+            }
+        }
+        break;
+    default: /* N_STAR: may match nothing */
+        break;
+    }
+}
+
+/* Chooses the strings to search for before running the DFA, if there are good
+ * ones. Returns 1 and fills 'out' when every match must contain one of them. */
+static int lit_pick_prefilter(const ReParser *p, int top, int icase, LitSet *out) {
+    LitInfo info;
+    lit_info(p, top, icase, 0, &info);
+    const LitSet *usable = lit_usable(&info);
+    if (!usable || usable->n == 0) {
+        return 0;
+    }
+    for (int i = 0; i < usable->n; i++) {
+        if (usable->len[i] < LIT_MIN_USEFUL || memchr(usable->s[i], '\n', (size_t)usable->len[i])) {
+            return 0;
+        }
+    }
+    *out = *usable;
+    return 1;
+}
+
 /* ---- Lazy DFA ------------------------------------------------------------ */
 
 /* A DFA state is the set of NFA positions that are still "alive" (before the
@@ -824,6 +1076,8 @@ typedef struct {
     unsigned *mark;        /* scratch: visited NFA positions */
     unsigned gen;
     int *stack, *list_a, *list_b;
+    LitSet prefilter;      /* strings of which every match contains one */
+    int has_prefilter;
 } Dfa;
 
 static void dfa_expand(Dfa *d, int pc, int *out, int *out_n) {
@@ -1066,6 +1320,9 @@ static Dfa *dfa_build(const char *const *regexes, int n, int icase, const char *
         d->list_a = malloc((size_t)(pr.n + 1) * sizeof *d->list_a);
         d->list_b = malloc((size_t)(pr.n + 1) * sizeof *d->list_b);
     }
+    if (d) {
+        d->has_prefilter = lit_pick_prefilter(&p, top, icase, &d->prefilter);
+    }
     free(p.nodes);
     if (!d || !d->trans || !d->hash || !d->mark || !d->stack || !d->list_a || !d->list_b) {
         *why = "out of memory";
@@ -1111,14 +1368,27 @@ static int dfa_search(Dfa *d, const unsigned char *line, size_t len) {
 enum { FMT_NONE = 0, FMT_TXT, FMT_CSV, FMT_JSON };
 
 typedef struct {
+    const unsigned char *text;
+    size_t len;
+    int level;
+} LevelWord;
+
+typedef struct {
     Pattern include[MAX_PATTERNS];
     int n_include;
     Pattern exclude[MAX_PATTERNS];
     int n_exclude;
     Dfa *dfa;  /* all -r expressions compiled together, NULL if there are none */
+    Pattern prefilter[LIT_MAX]; /* strings found by lit_pick_prefilter() */
+    int n_prefilter;
+    Pattern *cand[MAX_PATTERNS + LIT_MAX]; /* what the chunk scan looks for: -e + prefilter */
+    int n_cand;
     int n_regex;
     Level levels[MAX_LEVELS];
     int n_levels;
+    /* All the level words sorted by first byte, for classify(). */
+    LevelWord level_words[MAX_LEVELS * MAX_LEVEL_WORDS];
+    int level_start[257]; /* words starting with byte b: level_words[level_start[b] .. level_start[b+1]) */
     unsigned long long unclassified; /* matches with no level */
     unsigned long long max_matches;  /* 0 = unlimited */
     int count_only;
@@ -1181,26 +1451,6 @@ static size_t pattern_find(const Pattern *p, const unsigned char *hay, size_t n,
     return NOT_FOUND;
 }
 
-static int is_word_char(unsigned char c) {
-    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
-}
-
-/* The pattern occurs as a whole word (letters, digits and '_' around it). */
-static int word_found(const Pattern *p, const unsigned char *hay, size_t n) {
-    size_t from = 0;
-    for (;;) {
-        size_t pos = pattern_find(p, hay, n, from);
-        if (pos == NOT_FOUND) {
-            return 0;
-        }
-        size_t end = pos + p->len;
-        if ((pos == 0 || !is_word_char(hay[pos - 1])) && (end == n || !is_word_char(hay[end]))) {
-            return 1;
-        }
-        from = pos + 1;
-    }
-}
-
 /* Picks the byte of the pattern that is rarest in the text, judging by the
  * byte frequencies of a sample of the file. */
 static void pattern_pick_rare(Pattern *p, const unsigned long long freq[256]) {
@@ -1259,17 +1509,60 @@ static int line_matches(const Query *q, const unsigned char *line, size_t len) {
     return 1;
 }
 
-/* Index of the first level that matches the line, or -1. */
+static int is_word_char(unsigned char c) {
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+}
+
+/* Index of the first level that has a word in the line, or -1. A word counts when
+ * it stands on its own, i.e. it matches \bword\b (what the Python engine uses).
+ * Instead of searching each word through the whole line, one pass looks at the
+ * bytes that can start a word and only compares there. */
 static int classify(const Query *q, const unsigned char *line, size_t len) {
-    for (int i = 0; i < q->n_levels; i++) {
-        const Level *lv = &q->levels[i];
-        for (int w = 0; w < lv->n_words; w++) {
-            if (word_found(&lv->words[w], line, len)) {
-                return i;
+    int best = q->n_levels;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = line[i];
+        int from = q->level_start[c], to = q->level_start[c + 1];
+        for (int k = from; k < to; k++) {
+            const LevelWord *w = &q->level_words[k];
+            if (w->level >= best || len - i < w->len || memcmp(line + i, w->text, w->len) != 0) {
+                continue;
+            }
+            size_t end = i + w->len;
+            int before = i > 0 && is_word_char(line[i - 1]);
+            int after = end < len && is_word_char(line[end]);
+            if (before != is_word_char(w->text[0]) && after != is_word_char(w->text[w->len - 1])) {
+                best = w->level;
+                if (best == 0) {
+                    return 0;
+                }
             }
         }
     }
-    return -1;
+    return best < q->n_levels ? best : -1;
+}
+
+/* Sorts all the level words by first byte (a counting sort). */
+static void build_level_table(Query *q) {
+    int count[256] = {0};
+    for (int i = 0; i < q->n_levels; i++) {
+        for (int w = 0; w < q->levels[i].n_words; w++) {
+            count[q->levels[i].words[w].text[0]]++;
+        }
+    }
+    q->level_start[0] = 0;
+    for (int b = 0; b < 256; b++) {
+        q->level_start[b + 1] = q->level_start[b] + count[b];
+    }
+    int fill[256];
+    for (int b = 0; b < 256; b++) {
+        fill[b] = q->level_start[b];
+    }
+    for (int i = 0; i < q->n_levels; i++) { /* levels in order: a byte's words stay ordered */
+        for (int w = 0; w < q->levels[i].n_words; w++) {
+            const Pattern *p = &q->levels[i].words[w];
+            q->level_words[fill[p->text[0]]++] = (LevelWord){p->text, p->len, i};
+        }
+    }
 }
 
 /* Parses "NAME=WORD1,WORD2" and adds it to the query. Returns 0 on success. */
@@ -1724,9 +2017,10 @@ static unsigned long long count_newlines(const unsigned char *p, size_t n) {
 }
 
 typedef struct {
-    unsigned long long lines; /* lines covered (up to the last one handled when stopped) */
-    size_t consumed;          /* bytes covered */
-    int stop;                 /* the search must end */
+    unsigned long long lines;      /* lines covered (up to the last one handled when stopped) */
+    size_t consumed;               /* bytes covered */
+    int stop;                      /* the search must end */
+    unsigned long long candidates; /* lines that had to be examined */
 } RegionResult;
 
 /* Searches a region that starts at the beginning of a line and ends at the end
@@ -1736,9 +2030,9 @@ typedef struct {
  * so no match can span two lines. */
 static RegionResult scan_region(Query *q, const unsigned char *data, size_t size,
                                 unsigned long long first_line_no, unsigned long long *matches) {
-    RegionResult r = {0, 0, 0};
-    size_t next[MAX_PATTERNS]; /* next occurrence of each pattern at or after 'cursor' */
-    for (int i = 0; i < q->n_include; i++) {
+    RegionResult r = {0, 0, 0, 0};
+    size_t next[MAX_PATTERNS + LIT_MAX]; /* next occurrence of each candidate at or after 'cursor' */
+    for (int i = 0; i < q->n_cand; i++) {
         next[i] = UNKNOWN;
     }
     size_t cursor = 0;                   /* start of the first line not handled yet */
@@ -1746,12 +2040,12 @@ static RegionResult scan_region(Query *q, const unsigned char *data, size_t size
 
     while (cursor < size) {
         size_t best = NOT_FOUND;
-        for (int i = 0; i < q->n_include; i++) {
+        for (int i = 0; i < q->n_cand; i++) {
             if (next[i] == NOT_FOUND) {
                 continue; /* this pattern does not occur any more */
             }
             if (next[i] == UNKNOWN || next[i] < cursor) {
-                next[i] = pattern_find_fast(&q->include[i], data, size, cursor);
+                next[i] = pattern_find_fast(q->cand[i], data, size, cursor);
             }
             if (next[i] < best) {
                 best = next[i];
@@ -1774,6 +2068,7 @@ static RegionResult scan_region(Query *q, const unsigned char *data, size_t size
         }
 
         int stop = handle_line(q, first_line_no + lines_before, data + ls, len, matches);
+        r.candidates++;
         lines_before++;
         cursor = nl ? le + 1 : size;
         if (stop) {
@@ -1799,7 +2094,7 @@ static RegionResult scan_region(Query *q, const unsigned char *data, size_t size
  * the lines match, because then jumping from match to match saves nothing. */
 static RegionResult scan_region_lines(Query *q, const unsigned char *data, size_t size,
                                       unsigned long long first_line_no, unsigned long long *matches) {
-    RegionResult r = {0, 0, 0};
+    RegionResult r = {0, 0, 0, 0};
     size_t start = 0;
     unsigned long long lines_before = 0;
 
@@ -1843,9 +2138,12 @@ static void scan_mapped(Query *q, const unsigned char *data, size_t size,
     for (size_t i = 0; i < sample; i++) {
         freq[data[i]]++;
     }
-    for (int i = 0; i < q->n_include; i++) {
-        pattern_pick_rare(&q->include[i], freq);
+    for (int i = 0; i < q->n_cand; i++) {
+        pattern_pick_rare(q->cand[i], freq);
     }
+    /* Without a literal every line must go through the DFA anyway. */
+    int can_skip = q->n_cand > 0 && (!q->dfa || q->n_prefilter > 0);
+    int hold = 0; /* chunks left to read line by line before trying to skip again */
 
     while (!stop && pos < size) {
         size_t end = size - pos > MAP_CHUNK ? pos + MAP_CHUNK : size;
@@ -1854,9 +2152,19 @@ static void scan_mapped(Query *q, const unsigned char *data, size_t size,
             end = nl ? (size_t)(nl - data) + 1 : size;
         }
         unsigned long long matches_before = matches;
-        RegionResult r = dense || q->dfa ? scan_region_lines(q, data + pos, end - pos, lines + 1, &matches)
-                               : scan_region(q, data + pos, end - pos, lines + 1, &matches);
-        dense = r.lines > 0 && (matches - matches_before) * 3 > r.lines;
+        int by_lines = !can_skip || dense || hold > 0;
+        RegionResult r = by_lines ? scan_region_lines(q, data + pos, end - pos, lines + 1, &matches)
+                                  : scan_region(q, data + pos, end - pos, lines + 1, &matches);
+        if (hold > 0) {
+            hold--;
+        }
+        /* In region mode we know how many lines had to be examined; reading line
+         * by line all we know is how many matched. */
+        unsigned long long busy = by_lines ? matches - matches_before : r.candidates;
+        dense = r.lines > 0 && busy * 3 > r.lines;
+        if (!by_lines && dense) {
+            hold = 3; /* the prefilter is not selective here: do not flip every chunk */
+        }
         lines += r.lines;
         consumed = pos + r.consumed;
         stop = r.stop;
@@ -1976,6 +2284,15 @@ int main(int argc, char **argv) {
         }
     }
     if (check_only) {
+        if (q->dfa && q->dfa->has_prefilter) {
+            for (int i = 0; i < q->dfa->prefilter.n; i++) {
+                fputs("#prefilter ", stderr);
+                for (int k = 0; k < q->dfa->prefilter.len[i]; k++) {
+                    fprintf(stderr, "%02x", q->dfa->prefilter.s[i][k]);
+                }
+                fputc('\n', stderr);
+            }
+        }
         return 0;
     }
 
@@ -1986,6 +2303,25 @@ int main(int argc, char **argv) {
         if (pattern_init(&q->include[i], include_args[i], fold) != 0) {
             fputs("Error: empty pattern or out of memory.\n", stderr);
             return 2;
+        }
+    }
+    for (int i = 0; i < n_include; i++) {
+        q->cand[q->n_cand++] = &q->include[i];
+    }
+    if (q->dfa && q->dfa->has_prefilter) {
+        for (int i = 0; i < q->dfa->prefilter.n; i++) {
+            Pattern *pf = &q->prefilter[q->n_prefilter];
+            char text[LIT_LEN + 1];
+            memcpy(text, q->dfa->prefilter.s[i], (size_t)q->dfa->prefilter.len[i]);
+            text[q->dfa->prefilter.len[i]] = '\0';
+            if (pattern_init(pf, text, fold) == 0) {
+                q->cand[q->n_cand++] = pf;
+                q->n_prefilter++;
+            }
+        }
+        if (q->n_prefilter != q->dfa->prefilter.n) { /* could not set them all up: do not skip */
+            q->n_cand -= q->n_prefilter;
+            q->n_prefilter = 0;
         }
     }
     for (int i = 0; i < n_exclude; i++) {
@@ -2001,6 +2337,8 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
+
+    build_level_table(q);
 
     FILE *f = fopen(path, "rb");
     if (!f) {
