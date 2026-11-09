@@ -111,3 +111,33 @@ A command-line utility designed to search for patterns, regular expressions, and
 - selftest.py: there are now 416 checks, including 22 complex, hand-crafted expressions (involving optional elements, {0,n} quantifiers, empty branches, etc.). I intentionally broke the literal-parsing logic five times: the self-test detected four of these instances, while the fifth proved harmless by design (the engine continues to function correctly even if that specific failure occurs).
 
 -- Comments: -p ips remains at around 200 MB/s, because the bottleneck is the automaton itself, processing byte by byte. So it stays without fixed text. With -i: the pre-filter uses a slow search method, so using -i with a regex offers little gain (1.3 s vs. 1.1 s). These are things I didn't improve, wasn't actually worth it.
+
+### 09/11/2026
+
+- The C code is divided into modules, and the engine uses threads.
+- `queries.json` and `gen_logs.py` do not change.
+- `log_searcher.c` retains main(), while the rest resides in header files included in a single compilation unit, so there is no loss in speed. Using a single core, I benchmarked the new version (with -j 1) against the previous one: the execution times were the same (±5%).
+
+
+| Archivo | Contenido |
+| :--- | :--- |
+| `lg_regex.h` | motor de regex autónomo |
+| `lg_pattern.h` | búsqueda de literales |
+| `lg_query.h` | qué buscar y clasificación de niveles |
+| `lg_export.h` | escritura de `.txt`, `.csv` y `.json` |
+| `lg_scan.h` | lectura, bloques e hilos |
+| `lg_thread.h` /<br>`lg_platform.h` | hilos para Windows y Linux, y constantes comunes |
+
+- Each worker searches for 4 MiB blocks using its own automaton. The main thread collects these in order, corrects the line numbers, and writes the output, ensuring that the result remains consistent regardless of the number of threads used. This functionality is only activated if the file is memory-mapped, exceeds 16 MiB in size, and the `-m` flag is not used. By default, it employs one thread per CPU core (up to a maximum of 16); you can also specify the number of threads using `-j N` (in the C version) or `--threads N` (in `loggrep.py`).
+
+### Verification:
+
+- Compared to the previous version: approximately 3,600 test runs using the `-j` flag (with values ​​from 1 to 5), varying block sizes (1 and 64 bytes), and covering literals, regex, nesting levels, and exports—with no discrepancies found. Testing was also performed using the thread sanitizer (confirming the absence of data races) and memory sanitizers.
+- Large files: Processing `big.log` with `-j 8` and `-j 20` yields the same results as the single-threaded execution, including an output of 2.5 million lines (241 MB).
+- `selftest.py`: This suite now includes 444 checks and compiles its own version of the program using tiny block sizes to test threading. I intentionally broke the threading logic four times; the suite detected three of these instances. The fourth case—skipping a block—causes the program to hang rather than fail.
+
+### Pay attention to the compilation step.
+> On Windows, the command remains the same as always. On Linux or macOS, you need to add -pthread
+> > python loggrep.py big.log -p ips --count --threads n
+
+-- Comments: The comparison that interests me most is `--threads 1` versus 4, 8, 12—and, on my home PC, 20—across two types of searches: `-p ips` (CPU-intensive, should scale well) and `-e RARE_NEEDLE_3` on a large log file (memory-bound, so it will scale poorly). Based on these timings, I determined the default maximum number of threads—currently set to 16, though without any concrete justification.
