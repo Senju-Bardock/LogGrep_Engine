@@ -119,7 +119,7 @@ A command-line utility designed to search for patterns, regular expressions, and
 - `log_searcher.c` retains main(), while the rest resides in header files included in a single compilation unit, so there is no loss in speed. Using a single core, I benchmarked the new version (with -j 1) against the previous one: the execution times were the same (±5%).
 
 
-| Archivo | Contenido |
+| File | Content |
 | :--- | :--- |
 | `lg_regex.h` | standalone regex engine |
 | `lg_pattern.h` | literal search |
