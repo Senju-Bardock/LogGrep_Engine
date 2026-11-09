@@ -103,7 +103,8 @@ def check_chunk_boundaries(tmp, log):
         print("skip  chunk-boundary check (needs gcc and log_searcher.c next to this script)")
         return 0, 0
     tiny = tmp / ("tiny.exe" if os.name == "nt" else "tiny")
-    build = subprocess.run([compiler, "-O2", "-DMAP_CHUNK=64", "-o", str(tiny), str(source)], capture_output=True)
+    flags = ["-O2", "-DMAP_CHUNK=64", "-DPAR_MIN_BYTES=0"] + ([] if os.name == "nt" else ["-pthread"])
+    build = subprocess.run([compiler] + flags + ["-o", str(tiny), str(source)], capture_output=True)
     if build.returncode != 0:
         print("skip  chunk-boundary check (could not compile the test build)")
         return 0, 0
@@ -116,12 +117,18 @@ def check_chunk_boundaries(tmp, log):
     for extra in searches:
         for flags in ([], ["-c"]):
             cmd = extra + levels + flags + [str(log)]
-            a = subprocess.run([str(tiny)] + cmd, capture_output=True)
+            a = subprocess.run([str(tiny), "-j", "1"] + cmd, capture_output=True)
             b = subprocess.run([str(tiny), "-B"] + cmd, capture_output=True)
             checks += 1
             if (a.stdout, a.stderr, a.returncode) != (b.stdout, b.stderr, b.returncode):
                 failures += 1
                 print(f"FAIL  chunk boundaries: {' '.join(extra + flags)}")
+            for threads in ("2", "5"):  # the same search split between several threads
+                t = subprocess.run([str(tiny), "-j", threads] + cmd, capture_output=True)
+                checks += 1
+                if (t.stdout, t.stderr, t.returncode) != (b.stdout, b.stderr, b.returncode):
+                    failures += 1
+                    print(f"FAIL  {threads} threads give a different result: {' '.join(extra + flags)}")
     return checks, failures
 
 
@@ -293,8 +300,9 @@ def main():
                 py = run("python", log, queries, extra + flags)
                 c = run("c", log, queries, extra + flags)
                 c_blocks = run("c", log, queries, extra + flags + ["--no-mmap"])
+                c_threads = run("c", log, queries, extra + flags + ["--threads", "3"])
                 checks += 1
-                if py != c or py != c_blocks:
+                if py != c or py != c_blocks or py != c_threads:
                     failures += 1
                     print(f"FAIL  {name} [{mode}]: console output or summary differ")
             # exported files, byte by byte

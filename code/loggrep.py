@@ -107,7 +107,7 @@ class Stats:
 
 
 def search_python(path, matcher, stats, max_matches=0, levels=None, count_only=False,
-                  export=None, severity=None, no_mmap=False):
+                  export=None, severity=None, no_mmap=False, threads=None):
     """Yields (line_number, line_bytes, level) for every match.
 
     Reads in binary mode and only decodes the lines that match, so it is
@@ -196,7 +196,7 @@ def c_unsupported_reason(matcher, levels, paths=()):
 
 
 def search_c(path, matcher, stats, max_matches=0, levels=None, count_only=False,
-             export=None, severity=None, no_mmap=False):
+             export=None, severity=None, no_mmap=False, threads=None):
     """Runs log_searcher and yields (line_number, line_bytes, level) from its stdout.
 
     The binary prints one 'number|LEVEL|content' line per match (the level
@@ -220,6 +220,8 @@ def search_c(path, matcher, stats, max_matches=0, levels=None, count_only=False,
         cmd.append("-c")
     if no_mmap:
         cmd.append("-B")
+    if threads is not None:
+        cmd += ["-j", str(threads)]
     for name, words in levels.items():
         cmd += ["-l", f"{name}={','.join(words)}"]
     if export:
@@ -379,6 +381,8 @@ def parse_args():
     p.add_argument("--no-color", action="store_true", help="disable colors")
     p.add_argument("--engine", choices=["auto", "python", "c"], default="auto",
                    help="search engine: auto uses C when available and possible (default)")
+    p.add_argument("-j", "--threads", type=int, default=None, metavar="N",
+                   help="C engine: threads to search with (default: one per core, at most 16; 1 = single thread)")
     p.add_argument("--no-mmap", action="store_true",
                    help="C engine: read the file in blocks instead of memory-mapping it")
     p.add_argument("--list-profiles", action="store_true", help="list available profiles and exit")
@@ -443,7 +447,7 @@ def main():
 
     start = time.perf_counter()
     results = ENGINES[engine_name](args.file, matcher, stats, args.max, levels, count_only,
-                                   c_export, severity, args.no_mmap)
+                                   c_export, severity, args.no_mmap, args.threads)
     try:
         for n, raw, level in results:
             stats.matches += 1
