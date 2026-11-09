@@ -121,12 +121,12 @@ A command-line utility designed to search for patterns, regular expressions, and
 
 | Archivo | Contenido |
 | :--- | :--- |
-| `lg_regex.h` | motor de regex autónomo |
-| `lg_pattern.h` | búsqueda de literales |
-| `lg_query.h` | qué buscar y clasificación de niveles |
-| `lg_export.h` | escritura de `.txt`, `.csv` y `.json` |
-| `lg_scan.h` | lectura, bloques e hilos |
-| `lg_thread.h` /<br>`lg_platform.h` | hilos para Windows y Linux, y constantes comunes |
+| `lg_regex.h` | standalone regex engine |
+| `lg_pattern.h` | literal search |
+| `lg_query.h` | what to look for and level classification |
+| `lg_export.h` | writing of `.txt`, `.csv`, and `.json` files |
+| `lg_scan.h` | reading, blocks, and threads |
+| `lg_thread.h` /<br>`lg_platform.h` | threads for Windows and Linux, and common constants |
 
 - Each worker searches for 4 MiB blocks using its own automaton. The main thread collects these in order, corrects the line numbers, and writes the output, ensuring that the result remains consistent regardless of the number of threads used. This functionality is only activated if the file is memory-mapped, exceeds 16 MiB in size, and the `-m` flag is not used. By default, it employs one thread per CPU core (up to a maximum of 16); you can also specify the number of threads using `-j N` (in the C version) or `--threads N` (in `loggrep.py`).
 
