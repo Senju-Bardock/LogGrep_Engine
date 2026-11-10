@@ -144,7 +144,7 @@ A command-line utility designed to search for patterns, regular expressions, and
 
 ### 10/11/2026
 
-#### This day has been code testing and supervision[^1]
+#### This day has been code testing and supervision
 
 - The acceleration of the pre-filter using `-i` and the implementation of continuous block scanning for regex patterns lacking a fixed string remain as pending tasks.
 
