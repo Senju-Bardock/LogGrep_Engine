@@ -141,3 +141,22 @@ A command-line utility designed to search for patterns, regular expressions, and
 > > python loggrep.py big.log -p ips --count --threads n
 
 -- Comments: The comparison that interests me most is `--threads 1` versus 4, 8, 12—and, on my home PC, 20—across two types of searches: `-p ips` (CPU-intensive, should scale well) and `-e RARE_NEEDLE_3` on a large log file (memory-bound, so it will scale poorly). Based on these timings, I determined the default maximum number of threads—currently set to 16, though without any concrete justification.
+
+### 10/11/2026
+
+#### This day has been code testing and supervision[^1]
+
+- The acceleration of the pre-filter using `-i` and the implementation of continuous block scanning for regex patterns lacking a fixed string remain as pending tasks.
+
+- My results with multithreading are very impressive. For `ips`, the execution time drops from 1.32 seconds with a single thread to 0.18 seconds with 12 threads—a 7.3x speedup—and the automatic mode yields the same result as `--threads 12`. This confirms that the CPU workload scales almost linearly with the number of cores. On my home PC, which has 20 cores, the time should decrease even further, though it’s hard to say by how much—it might eventually approach the memory bandwidth limit.
+
+This shifts the perspective on the two pending improvements, as multithreading already addresses much of what they were intended to achieve:
+
+- Continuous block scanning for regex patterns without a fixed string: While this could potentially nearly double the speed of an individual thread, the execution time for `ips` on my machine is already below 0.2 seconds. This optimization would likely only be significant on systems with fewer cores. Something that I'm considering
+- Pre-filtering with `-i`: Currently, a regex operation using `-i` takes about 1.1 seconds on a single thread in the small test environment. With multithreading, this would also drop to the 0.1–0.2 second range, meaning the absolute gain would be minimal.
+
+#### Just found another problem, Python as a bottleneck:
+
+With the C implementation taking 0.1–0.2 seconds, the overhead of starting up Python and reading `queries.json` can end up being more significant than the search itself when dealing with small files. It makes sense to measure this.
+
+I'll be working on this last bottleneck problem and then, I'll implement two improvements more: Speed ​​up the pre-filter using `-i`, and process blocks in one go—avoiding line breaks (`\r`) within regex patterns that lack fixed text—which could potentially double the `ips` speed. This could leave the entire engine available for systems with few cores.
