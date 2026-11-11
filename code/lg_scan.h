@@ -48,6 +48,25 @@ static int emit_match(const Query *q, Exporter *ex, unsigned long long line_no, 
         export_match(ex, line_no, level >= 0 ? q->levels[level].name : ex->fallback_level, line, len);
     }
     if (!q->count_only) {
+        if (q->console) { /* the exact text loggrep.py prints without colours */
+            const char *shown = level >= 0 ? q->levels[level].name : (ex ? ex->fallback_level : NULL);
+            size_t n;
+            const unsigned char *text = utf8_clean(line, len, &n);
+            printf("%9llu | ", line_no);
+            if (shown) {
+                printf("[%s] ", shown);
+            }
+            fwrite(text, 1, n, stdout);
+#ifdef _WIN32
+            fputs("\r\n", stdout); /* what Python's print writes on Windows */
+#else
+            fputc('\n', stdout);
+#endif
+            if (ferror(stdout)) {
+                return 1;
+            }
+            return 0;
+        }
         if (q->n_levels) {
             printf("%llu|%s|", line_no, level >= 0 ? q->levels[level].name : "");
         } else {

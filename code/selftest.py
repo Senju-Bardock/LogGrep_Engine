@@ -324,6 +324,12 @@ def main():
             if run("auto", log, queries, fallback + flags) != run("python", log, queries, fallback + flags):
                 failures += 1
                 print("FAIL  unsupported regex: automatic fallback to Python gives different results")
+        # --engine c must refuse (not silently use Python) a regex the C engine cannot handle
+        refused = run("c", log, queries, ["-r", r"(\w)\1", "--count"])
+        checks += 1
+        if refused[2] == 0:
+            failures += 1
+            print("FAIL  --engine c accepted a regular expression with a backreference")
         extra_checks, extra_failures = check_chunk_boundaries(tmp, log)
         checks += extra_checks
         failures += extra_failures

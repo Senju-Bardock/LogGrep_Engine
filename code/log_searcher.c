@@ -17,7 +17,7 @@
  * process may crash. Use -B to read log files that are being rotated in place.
  *
  * Usage:
- *     log_searcher [-i] [-c] [-B] [-j N] [-m N] [-x EXCLUDE]... [-l LEVEL=WORD,WORD]...
+ *     log_searcher [-i] [-c] [-f] [-B] [-j N] [-m N] [-x EXCLUDE]... [-l LEVEL=WORD,WORD]...
  *                  [-o OUTFILE -F txt|csv|json [-s SEVERITY]]
  *                  [-e PATTERN]... [-r REGEX]... FILE
  *     log_searcher [-i] -k -r REGEX [-r REGEX]...        (only check the regexes)
@@ -40,6 +40,10 @@
  *                       exact case (like the regex \b(?:W1|W2)\b). Words are
  *                       expected to start and end with letters, digits or '_'.
  *     -c                count only: do not print lines, just the #stats line
+ *     -f                print each line as "<number, 9 wide> | [LEVEL] <text>", the format
+ *                       loggrep.py shows when it does not use colours (-s gives the level
+ *                       for lines that have none); with invalid UTF-8 replaced by U+FFFD
+ *                       and, on Windows, CR LF line ends. Replaces the number|content format.
  *     -B                do not use memory mapping: read the file in blocks
  *     -j N              threads to search with (default: the number of cores, at
  *                       most 16; 1 = a single thread). Threads are used only when the
@@ -87,7 +91,7 @@
 #include "lg_scan.h"
 
 static void usage(void) {
-    fputs("Usage: log_searcher [-i] [-c] [-B] [-j N] [-m N] [-x EXCLUDE]... [-l LEVEL=WORD,WORD]... "
+    fputs("Usage: log_searcher [-i] [-c] [-f] [-B] [-j N] [-m N] [-x EXCLUDE]... [-l LEVEL=WORD,WORD]... "
           "[-o OUTFILE -F txt|csv|json [-s SEVERITY]] [-e PATTERN]... [-r REGEX]... FILE\n"
           "       log_searcher [-i] -k -r REGEX [-r REGEX]...\n",
           stderr);
@@ -112,6 +116,8 @@ int main(int argc, char **argv) {
             q->no_mmap = 1;
         } else if (strcmp(argv[i], "-c") == 0) {
             q->count_only = 1;
+        } else if (strcmp(argv[i], "-f") == 0) {
+            q->console = 1;
         } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             q->max_matches = strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "-j") == 0 && i + 1 < argc) {

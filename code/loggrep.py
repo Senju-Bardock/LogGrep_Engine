@@ -17,18 +17,15 @@ flags...) is searched by the Python engine.
 """
 
 import argparse
-import csv
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
 from collections import Counter
-from pathlib import Path
 
-DEFAULT_QUERIES = Path(__file__).with_name("queries.json")
+DEFAULT_QUERIES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queries.json")
 
 # --- ANSI colors ------------------------------------------------------------
 RESET = "\033[0m"
@@ -107,7 +104,7 @@ class Stats:
 
 
 def search_python(path, matcher, stats, max_matches=0, levels=None, count_only=False,
-                  export=None, severity=None, no_mmap=False, threads=None):
+                  export=None, severity=None, no_mmap=False, threads=None, console=False):
     """Yields (line_number, line_bytes, level) for every match.
 
     Reads in binary mode and only decodes the lines that match, so it is
@@ -132,18 +129,40 @@ C_MAX_PATTERNS = 64  # limits compiled into log_searcher.c
 C_MAX_LEVELS = 16
 C_MAX_LEVEL_WORDS = 16
 C_MAX_LEVEL_NAME = 31
-STATS_RE = re.compile(rb"#stats lines=(\d+) bytes=(\d+) matches=(\d+)(?: levels=(\S+))?")
+_binary_cache = []
 
 
 def find_c_binary():
     """Looks for log_searcher next to this script, then in the PATH."""
-    names = ["log_searcher.exe", "log_searcher"] if os.name == "nt" else ["log_searcher"]
-    here = Path(__file__).resolve().parent
-    for name in names:
-        candidate = here / name
-        if candidate.is_file():
-            return str(candidate)
-    return shutil.which("log_searcher")
+    if _binary_cache:
+        return _binary_cache[0]
+    names = ["log_searcher.exe"] if os.name == "nt" else ["log_searcher"]
+    folders = [os.path.dirname(os.path.realpath(__file__))] + os.environ.get("PATH", "").split(os.pathsep)
+    found = None
+    for folder in folders:
+        for name in names:
+            candidate = os.path.join(folder, name)
+            if folder and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                found = candidate
+                break
+        if found:
+            break
+    _binary_cache.append(found)
+    return found
+
+
+def parse_stats(err):
+    """Reads the '#stats lines=N bytes=N matches=N [levels=A:n,B:n,-:n]' line that
+    log_searcher writes to stderr. Returns a dict of bytes -> bytes, or None."""
+    for row in err.splitlines():
+        if row.startswith(b"#stats "):
+            return dict(item.split(b"=", 1) for item in row[7:].split())
+    return None
+
+
+class CUnsupported(Exception):
+    """log_searcher refused the search (a regular expression it cannot handle).
+    It says so before doing anything, so the search can be run again in Python."""
 
 
 def c_levels_supported(levels):
@@ -162,20 +181,6 @@ def c_levels_supported(levels):
     return True
 
 
-def c_regex_problem(matcher):
-    """Asks log_searcher whether it supports these regular expressions.
-    Returns None if it does, or the reason if it does not."""
-    binary = find_c_binary()
-    cmd = [binary, "-k"] + (["-i"] if matcher.ignore_case else [])
-    for text in matcher.regexes:
-        cmd += ["-r", text]
-    proc = subprocess.run(cmd, capture_output=True)
-    if proc.returncode == 0:
-        return None
-    reason = proc.stderr.decode("utf-8", errors="replace").strip()
-    return reason.replace("Error: unsupported regular expression: ", "").rstrip(".") or "unsupported regular expression"
-
-
 def c_unsupported_reason(matcher, levels, paths=()):
     """Returns why the C engine cannot run this search, or None if it can."""
     if len(matcher.literals) + len(matcher.regexes) > C_MAX_PATTERNS or len(matcher.excludes) > C_MAX_PATTERNS:
@@ -184,10 +189,6 @@ def c_unsupported_reason(matcher, levels, paths=()):
         return "the C engine only supports ASCII patterns"
     if any(ch in t for t in matcher.literals + matcher.excludes for ch in "\r\n"):
         return "the C engine does not support patterns with line breaks"
-    if matcher.regexes and find_c_binary():
-        problem = c_regex_problem(matcher)
-        if problem:
-            return f"regular expression not supported by the C engine ({problem})"
     if not all(p.isascii() for p in paths):
         return "the C engine only supports ASCII file paths"
     if not c_levels_supported(levels):
@@ -196,7 +197,7 @@ def c_unsupported_reason(matcher, levels, paths=()):
 
 
 def search_c(path, matcher, stats, max_matches=0, levels=None, count_only=False,
-             export=None, severity=None, no_mmap=False, threads=None):
+             export=None, severity=None, no_mmap=False, threads=None, console=False):
     """Runs log_searcher and yields (line_number, line_bytes, level) from its stdout.
 
     The binary prints one 'number|LEVEL|content' line per match (the level
@@ -204,7 +205,10 @@ def search_c(path, matcher, stats, max_matches=0, levels=None, count_only=False,
     '#stats ...' line on stderr. In count-only mode it prints no lines at all
     and the totals are taken from the stats line. When 'export' is a
     (path, kind) pair, log_searcher writes the export file itself, which is
-    much faster than formatting every row in Python.
+    much faster than formatting every row in Python. With 'console' it also
+    prints the lines itself, in the format Python would use without colours,
+    straight to our stdout: nothing is yielded and the totals come from the
+    stats line.
     """
     levels = levels or {}
     binary = find_c_binary()
@@ -218,6 +222,10 @@ def search_c(path, matcher, stats, max_matches=0, levels=None, count_only=False,
         cmd += ["-m", str(max_matches)]
     if count_only:
         cmd.append("-c")
+    if console:
+        cmd.append("-f")
+        if severity:
+            cmd += ["-s", severity]
     if no_mmap:
         cmd.append("-B")
     if threads is not None:
@@ -226,7 +234,7 @@ def search_c(path, matcher, stats, max_matches=0, levels=None, count_only=False,
         cmd += ["-l", f"{name}={','.join(words)}"]
     if export:
         cmd += ["-o", export[0], "-F", export[1]]
-        if severity:
+        if severity and not console:
             cmd += ["-s", severity]
     for text in matcher.literals:
         cmd += ["-e", text]
@@ -236,40 +244,51 @@ def search_c(path, matcher, stats, max_matches=0, levels=None, count_only=False,
         cmd += ["-x", text]
     cmd.append(str(path))
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1 << 20)
-    try:
-        for raw in proc.stdout:
-            if levels:
-                number, level, text = raw.split(b"|", 2)
-                yield int(number), text.rstrip(b"\n"), (level.decode("ascii") or None)
-            else:
-                number, text = raw.split(b"|", 1)
-                yield int(number), text.rstrip(b"\n"), None
-    finally:
-        # If the consumer stopped early (for example with --max) the process is
-        # about to end by itself: closing the pipe makes it stop writing, and
-        # waiting lets it print its #stats line. Terminate it if it does not.
-        proc.stdout.close()
+    if console:
+        sys.stdout.flush()
+        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)  # stdout is inherited
+        err = proc.communicate()[1]
+        yield from ()  # (this is a generator: the work above runs on the first next())
+    else:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1 << 20)
         try:
-            proc.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            proc.terminate()
-            proc.wait()
-        err = proc.stderr.read()
-        proc.stderr.close()
-        code = proc.returncode
-        found = STATS_RE.search(err)
-        if found:
-            stats.lines, stats.bytes = int(found.group(1)), int(found.group(2))
-            if count_only:
-                stats.matches = int(found.group(3))
-                stats.c_counts = {}
-                if found.group(4):
-                    for item in found.group(4).decode("ascii").split(","):
-                        name, _, count = item.rpartition(":")
-                        stats.c_counts[name] = int(count)
-        if code == 2:
-            sys.exit("Error from log_searcher: " + err.decode("utf-8", errors="replace").strip())
+            for raw in proc.stdout:
+                if levels:
+                    number, level, text = raw.split(b"|", 2)
+                    yield int(number), text.rstrip(b"\n"), (level.decode("ascii") or None)
+                else:
+                    number, text = raw.split(b"|", 1)
+                    yield int(number), text.rstrip(b"\n"), None
+        finally:
+            # If the consumer stopped early (for example with --max) the process is
+            # about to end by itself: closing the pipe makes it stop writing, and
+            # waiting lets it print its #stats line. Terminate it if it does not.
+            proc.stdout.close()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                proc.wait()
+            err = proc.stderr.read()
+            proc.stderr.close()
+    code = proc.returncode
+    if console and code < 0:
+        raise BrokenPipeError  # killed by SIGPIPE: the reader of our stdout went away
+    found = parse_stats(err)
+    if found:
+        stats.lines, stats.bytes = int(found[b"lines"]), int(found[b"bytes"])
+        if count_only or console:
+            stats.matches = int(found[b"matches"])
+            stats.c_counts = {}
+            if found.get(b"levels"):
+                for item in found[b"levels"].decode("ascii").split(","):
+                    name, _, count = item.rpartition(":")
+                    stats.c_counts[name] = int(count)
+    if code == 2:
+        sys.exit("Error from log_searcher: " + err.decode("utf-8", errors="replace").strip())
+    if code == 3:
+        reason = err.decode("utf-8", errors="replace").strip()
+        raise CUnsupported(reason.replace("Error: unsupported regular expression: ", "").rstrip("."))
 
 
 ENGINES = {"python": search_python, "c": search_c}
@@ -314,7 +333,7 @@ def format_line(n, text, level, rx, use_color):
 
 def export_kind(path):
     """Export format from the file extension; exits with an error if unsupported."""
-    kind = Path(path).suffix.lower().lstrip(".")
+    kind = os.path.splitext(path)[1].lower().lstrip(".")
     if kind not in ("txt", "csv", "json"):
         sys.exit("Error: --export must end in .txt, .csv or .json")
     return kind
@@ -328,6 +347,7 @@ class Exporter:
         self.f = open(path, "w", encoding="utf-8", newline="")
         self.first = True
         if self.kind == "csv":
+            import csv  # only the Python exporter needs it
             self.writer = csv.writer(self.f)
             self.writer.writerow(["line", "level", "text"])
         elif self.kind == "json":
@@ -370,7 +390,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Log searcher with JSON profiles.")
     p.add_argument("file", nargs="?", help="log file to analyze")
     p.add_argument("-p", "--profile", help="profile name in queries.json")
-    p.add_argument("-q", "--queries", default=str(DEFAULT_QUERIES), help="path to the profiles JSON")
+    p.add_argument("-q", "--queries", default=DEFAULT_QUERIES, help="path to the profiles JSON")
     p.add_argument("-e", "--pattern", action="append", default=[], help="literal text to search for (repeatable)")
     p.add_argument("-r", "--regex", action="append", default=[], help="regular expression (repeatable)")
     p.add_argument("-x", "--exclude", action="append", default=[], help="exclude lines containing this text (repeatable)")
@@ -389,9 +409,24 @@ def parse_args():
     return p.parse_args()
 
 
+def enable_ansi():
+    """Makes the Windows console interpret colour codes. (os.system("") does the
+    same by accident but starts a whole cmd.exe, which is slow.)"""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        handle = kernel.GetStdHandle(-11)  # standard output
+        mode = ctypes.c_uint32()
+        if kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        pass
+
+
 def setup_console():
-    # Make the Windows cmd interpret ANSI codes and display UTF-8.
-    os.system("")
+    # Display UTF-8 whatever the console's code page is.
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -433,9 +468,32 @@ def main():
     matcher = Matcher(literals, regexes, excludes, ignore_case)
     levels = config.get("levels", {})
     use_color = not args.no_color and sys.stdout.isatty()
+    if use_color:
+        enable_ansi()
     kind = export_kind(args.export) if args.export else None
-    stats = Stats()
     engine_name = select_engine(args.engine, matcher, levels, [args.file])
+
+    start = time.perf_counter()
+    try:
+        try:
+            stats = execute(engine_name, args, matcher, levels, severity, use_color, kind)
+        except CUnsupported as problem:
+            # log_searcher refused a regular expression before doing anything.
+            if args.engine == "c":
+                sys.exit(f"Error: cannot use --engine c: regular expression not supported by the C engine ({problem}).")
+            engine_name = "python"
+            stats = execute(engine_name, args, matcher, levels, severity, use_color, kind)
+    except BrokenPipeError:
+        # For example: python loggrep.py app.log -p errors | more
+        sys.stderr.close()
+        return
+    print_stats(stats, time.perf_counter() - start, engine_name)
+
+
+def execute(engine_name, args, matcher, levels, severity, use_color, kind):
+    """Runs the search with one engine, printing and exporting as asked.
+    Returns the Stats of the run."""
+    stats = Stats()
     # The C engine writes the export file itself when it can (ASCII paths and names);
     # otherwise Python formats every row.
     c_export = None
@@ -444,10 +502,12 @@ def main():
     exporter = Exporter(args.export) if args.export and not c_export else None
     # With --count and nothing to export from Python, the lines are not needed at all.
     count_only = args.count and exporter is None
+    # When nobody in Python has to look at the lines (no colours, no Python export), the
+    # C engine prints them itself, in the same format: Python only reads its totals.
+    console = engine_name == "c" and not args.count and not use_color and exporter is None
 
-    start = time.perf_counter()
     results = ENGINES[engine_name](args.file, matcher, stats, args.max, levels, count_only,
-                                   c_export, severity, args.no_mmap, args.threads)
+                                   c_export, severity, args.no_mmap, args.threads, console)
     try:
         for n, raw, level in results:
             stats.matches += 1
@@ -461,18 +521,14 @@ def main():
             if args.max and stats.matches >= args.max:
                 results.close()
                 break
-    except BrokenPipeError:
-        # For example: python loggrep.py app.log -p errors | more
-        sys.stderr.close()
-        return
     finally:
         if exporter:
             exporter.close()
-    if stats.c_counts is not None:  # count-only run: merge the totals reported by C
+    if stats.c_counts is not None:  # the totals reported by C (count-only or console run)
         for name, count in stats.c_counts.items():
             if count:
                 stats.levels[(None if name == "-" else name) or severity or "NO_LEVEL"] += count
-    print_stats(stats, time.perf_counter() - start, engine_name)
+    return stats
 
 
 if __name__ == "__main__":

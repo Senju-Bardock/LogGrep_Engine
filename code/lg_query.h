@@ -40,6 +40,7 @@ typedef struct {
     unsigned long long max_matches; /* -m, 0 = unlimited */
     int count_only;                 /* -c */
     int no_mmap;                    /* -B: always read in blocks */
+    int console;                    /* -f: print lines the way loggrep.py does */
     int threads;                    /* -j, 0 = automatic */
 } Query;
 
