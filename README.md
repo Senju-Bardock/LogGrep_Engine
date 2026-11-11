@@ -160,3 +160,35 @@ This shifts the perspective on the two pending improvements, as multithreading a
 With the C implementation taking 0.1–0.2 seconds, the overhead of starting up Python and reading `queries.json` can end up being more significant than the search itself when dealing with small files. It makes sense to measure this.
 
 I'll be working on this last bottleneck problem and then, I'll implement two improvements more: Speed ​​up the pre-filter using `-i`, and process blocks in one go—avoiding line breaks (`\r`) within regex patterns that lack fixed text—which could potentially double the `ips` speed. This could leave the entire engine available for systems with few cores.
+
+### 11/11/2026
+
+- Five files are changed: loggrep.py, log_searcher.c, lg_query.h, lg_scan.h, and selftest.py. The other seven lg_*.h modules remain unchanged.
+- When you redirect the output, printing lines no longer goes through Python. In the case of terminal colors, however, Python continues to handle the formatting, as it is responsible for highlighting matches. Regarding startup time, the only measurable gains were a few milliseconds here and there; I implemented other changes as well
+- The C program has a new option, `-f`, which writes each line using the same format as Python (without colors)—for example: `7 | [ERROR] text`. When colors are disabled and no Python-based export is requested, `loggrep.py` uses this option, allowing the C program to write directly to the output. In this case, Python only reads the final totals.
+- loggrep.py no longer launches an extra process with -k before each regex search. It now executes the C-based engine, and if that engine returns exit code 3—indicating it does not support the expression—it re-runs the search using Python. When using --engine c, it continues to provide the same clear error message as before.
+- I removed `pathlib`, `shutil`, and the `csv` import (which is now only loaded if Python performs an export). I replaced `os.system("")`—which, on Windows, launches an entire `cmd.exe` instance with every execution—with a direct call to the console API, triggered only when colors are used.
+
+For this one I used a Linux enviroment instead of Windows
+
+| Case | Before | Now |
+| :--- | :--- | :--- |
+| 1M lines, `-p errors`, 118,000 lines printed | 341 ms | 110 ms (3.1×) |
+| 1M lines, `-e Request`, 494,000 lines printed | 1,127 ms | 214 ms (5.3×) |
+| Small file, `-p errors --count` | 39 ms | 34 ms |
+| Small file, regex `-p ips --count` | 39.5 ms | 37 ms |
+> For a small search, the overhead from Python—beyond the interpreter itself—amounts to about 11 ms (5 ms for imports, 3 ms for `argparse`, and 2.5 ms to invoke the C code); so, there isn’t much room for further optimization without rewriting the CLI.
+
+#### Checks:
+
+- The redirected output is identical to that of the previous version across 8 large searches, as is the summary.
+- When using a real terminal (pty), the color-coded output is identical to the previous version.
+- When piped to `head`, it terminates without errors in approximately 50 ms.
+- `selftest.py` now covers 445 checks, including verification that both the Python and C implementations produce identical output when handling invalid UTF-8 sequences and `\r` characters.
+- The C implementation has once again passed regression testing involving threads, tiny blocks, and the thread sanitizer (2,000 comparisons, with no discrepancies found).
+
+On Windows, C writes `\r\n` in this mode—just like Python’s `print`—and the autotest will verify this in the cmd.
+
+Now, using windows, printing to a file (the main change). my command `-p errors --no-color > output.txt` writes 594,050 lines in 0.29–0.35 seconds. In my environment, formatting each line in Python took about 2.4 µs; for that many lines, formatting alone would have taken over 1.4 seconds—not even counting the search process. My machine is faster than other I used, but it's highly unlikely that it could drop below 1 second using that approach; therefore, my result suggests that the C code is writing the lines directly. In the Linux environment, I measured a 3- to 5-fold improvement, depending on the number of lines; the improvement in my case on Windows should be similar—although that is my own estimate, not a measurement I've taken.
+
+--count (no change, as expected). With --count on big.log, you’re still at 0.10 s—the same as the 0.09–0.10 s I was already seeing when using threads. This phase didn’t involve the search process or the threads, so it couldn’t have improved that. And with 12 threads on test.log, I reach 0.03–0.04 s, or about 2.5 GB/s.
