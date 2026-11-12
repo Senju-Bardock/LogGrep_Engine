@@ -16,7 +16,6 @@ anchors, \\d \\w \\s \\b); anything else (lookaround, backreferences, inline
 flags...) is searched by the Python engine.
 """
 
-import argparse
 import json
 import os
 import re
@@ -386,27 +385,111 @@ def print_stats(stats, elapsed, engine):
 
 
 # --- CLI --------------------------------------------------------------------
-def parse_args():
-    p = argparse.ArgumentParser(description="Log searcher with JSON profiles.")
-    p.add_argument("file", nargs="?", help="log file to analyze")
-    p.add_argument("-p", "--profile", help="profile name in queries.json")
-    p.add_argument("-q", "--queries", default=DEFAULT_QUERIES, help="path to the profiles JSON")
-    p.add_argument("-e", "--pattern", action="append", default=[], help="literal text to search for (repeatable)")
-    p.add_argument("-r", "--regex", action="append", default=[], help="regular expression (repeatable)")
-    p.add_argument("-x", "--exclude", action="append", default=[], help="exclude lines containing this text (repeatable)")
-    p.add_argument("-i", "--ignore-case", action="store_true", help="case-insensitive matching")
-    p.add_argument("-m", "--max", type=int, default=0, help="stop after N matches")
-    p.add_argument("--count", action="store_true", help="do not print lines, only the summary")
-    p.add_argument("--export", metavar="FILE", help="export matches (.txt, .csv or .json)")
-    p.add_argument("--no-color", action="store_true", help="disable colors")
-    p.add_argument("--engine", choices=["auto", "python", "c"], default="auto",
-                   help="search engine: auto uses C when available and possible (default)")
-    p.add_argument("-j", "--threads", type=int, default=None, metavar="N",
-                   help="C engine: threads to search with (default: one per core, at most 16; 1 = single thread)")
-    p.add_argument("--no-mmap", action="store_true",
-                   help="C engine: read the file in blocks instead of memory-mapping it")
-    p.add_argument("--list-profiles", action="store_true", help="list available profiles and exit")
-    return p.parse_args()
+# The command line, described once. Each entry is (flags, the keyword arguments for
+# argparse's add_argument). fast_parse() reads the same table, so the two can not
+# drift apart.
+OPTIONS = [
+    (("file",), {"nargs": "?", "help": "log file to analyze"}),
+    (("-p", "--profile"), {"help": "profile name in queries.json"}),
+    (("-q", "--queries"), {"default": DEFAULT_QUERIES, "help": "path to the profiles JSON"}),
+    (("-e", "--pattern"), {"action": "append", "default": [], "help": "literal text to search for (repeatable)"}),
+    (("-r", "--regex"), {"action": "append", "default": [], "help": "regular expression (repeatable)"}),
+    (("-x", "--exclude"), {"action": "append", "default": [], "help": "exclude lines containing this text (repeatable)"}),
+    (("-i", "--ignore-case"), {"action": "store_true", "help": "case-insensitive matching"}),
+    (("-m", "--max"), {"type": int, "default": 0, "help": "stop after N matches"}),
+    (("--count",), {"action": "store_true", "help": "do not print lines, only the summary"}),
+    (("--export",), {"metavar": "FILE", "help": "export matches (.txt, .csv or .json)"}),
+    (("--no-color",), {"action": "store_true", "help": "disable colors"}),
+    (("--engine",), {"choices": ["auto", "python", "c"], "default": "auto",
+                     "help": "search engine: auto uses C when available and possible (default)"}),
+    (("-j", "--threads"), {"type": int, "default": None, "metavar": "N",
+                           "help": "C engine: threads to search with (default: one per core, at most 16; 1 = single thread)"}),
+    (("--no-mmap",), {"action": "store_true", "help": "C engine: read the file in blocks instead of memory-mapping it"}),
+    (("--list-profiles",), {"action": "store_true", "help": "list available profiles and exit"}),
+]
+
+
+def option_dest(flags):
+    """The attribute name argparse gives an option: its first long name, with '_'."""
+    long_names = [f for f in flags if f.startswith("--")]
+    return (long_names[0] if long_names else flags[0]).lstrip("-").replace("-", "_")
+
+
+class Args:
+    """What parse_args() returns: one attribute per option, like argparse's Namespace."""
+
+
+def fast_parse(argv):
+    """Reads the command line without argparse, which takes noticeable time to load
+    (in Python 3.14 it pulls in dozens of modules). It understands the usual forms:
+    exact option names, '--name=value' and a separate value. For anything else
+    (-h, abbreviations, -m5 style options, mistakes...) it returns None and
+    parse_args() asks argparse, which also gives the proper help and errors."""
+    values = {}
+    lookup = {}
+    for flags, kwargs in OPTIONS:
+        if flags[0].startswith("-"):
+            dest = option_dest(flags)
+            default = kwargs.get("default", False if kwargs.get("action") == "store_true" else None)
+            values[dest] = list(default) if isinstance(default, list) else default
+            for flag in flags:
+                lookup[flag] = (dest, kwargs)
+        else:
+            values[flags[0]] = None  # the positional argument
+    positional_dest = [flags[0] for flags, _ in OPTIONS if not flags[0].startswith("-")][0]
+
+    i, n = 0, len(argv)
+    while i < n:
+        token = argv[i]
+        i += 1
+        if not token.startswith("-"):
+            if values[positional_dest] is not None:
+                return None  # a second positional argument: argparse reports it
+            values[positional_dest] = token
+            continue
+        name, equals, inline = token.partition("=") if token.startswith("--") else (token, "", "")
+        spec = lookup.get(name)
+        if spec is None:
+            return None
+        dest, kwargs = spec
+        if kwargs.get("action") == "store_true":
+            if equals:
+                return None
+            values[dest] = True
+            continue
+        if equals:
+            value = inline
+        else:
+            if i >= n or argv[i].startswith("-"):
+                return None
+            value = argv[i]
+            i += 1
+        if "choices" in kwargs and value not in kwargs["choices"]:
+            return None
+        if kwargs.get("type") is int:
+            try:
+                value = int(value)
+            except ValueError:
+                return None
+        if kwargs.get("action") == "append":
+            values[dest].append(value)
+        else:
+            values[dest] = value
+    args = Args()
+    args.__dict__.update(values)
+    return args
+
+
+def parse_args(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    parsed = fast_parse(argv)
+    if parsed is not None:
+        return parsed
+    import argparse
+    parser = argparse.ArgumentParser(description="Log searcher with JSON profiles.")
+    for flags, kwargs in OPTIONS:
+        parser.add_argument(*flags, **kwargs)
+    return parser.parse_args(argv)
 
 
 def enable_ansi():
