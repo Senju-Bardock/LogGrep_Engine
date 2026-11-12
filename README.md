@@ -192,3 +192,49 @@ On Windows, C writes `\r\n` in this mode—just like Python’s `print`—and th
 Now, using windows, printing to a file (the main change). my command `-p errors --no-color > output.txt` writes 594,050 lines in 0.29–0.35 seconds. In my environment, formatting each line in Python took about 2.4 µs; for that many lines, formatting alone would have taken over 1.4 seconds—not even counting the search process. My machine is faster than other I used, but it's highly unlikely that it could drop below 1 second using that approach; therefore, my result suggests that the C code is writing the lines directly. In the Linux environment, I measured a 3- to 5-fold improvement, depending on the number of lines; the improvement in my case on Windows should be similar—although that is my own estimate, not a measurement I've taken.
 
 --count (no change, as expected). With --count on big.log, you’re still at 0.10 s—the same as the 0.09–0.10 s I was already seeing when using threads. This phase didn’t involve the search process or the threads, so it couldn’t have improved that. And with 12 threads on test.log, I reach 0.03–0.04 s, or about 2.5 GB/s.
+
+- The output is correct and looks good, though there is a nuance regarding where the time is actually being spent.
+
+- Confirmation of the output: I used python loggrep.py big.log -p errors --no-color > salida.txt, then powershell -command "Measure-Command { python loggrep.py test.log -p errors --count | Out-Null }", and `salida.txt` contains 594,050 lines—exactly the 594,050 matches reported in the summary. The C program writes the entire file, and no data is lost.
+
+Where the time goes: In the second measurement, `Measure-Command` reports a total execution time of 136 ms, while the summary indicates that the search itself took 0.03 s. The remaining ~105 ms account for everything other than the search: starting the Python interpreter, handling imports, launching `log_searcher.exe`, and collecting the results. In the first measurement, the total time was 196 ms, with 0.07 s spent on the search (the first run is typically slower due to caching and antivirus activity). In other words, for a file with 1 million lines, the search process now accounts for only a quarter of the total time taken by the command.
+
+For now I'm using:
+powershell -command "Measure-Command { python -c pass | Out-Null }"
+powershell -command "Measure-Command { python loggrep.py --list-profiles | Out-Null }"
+
+The first measurement provides a baseline—the overhead of having Python on your system, before doing anything else. The difference between the second and first measurements represents the cost of `loggrep.py` itself, prior to the actual search process. To determine the gains from this phase, I would need to repeat these measurements using a previous version of `loggrep.py` (which I could retrieve from Git—for instance, by using `git stash` or checking out the file from an earlier commit).
+
+As for what this means moving forward: if Python’s startup time on my machine is in the 50–80 ms range, there isn’t much room left for optimization within Python, as the bulk of that time is simply the cost of launching the interpreter. Reducing it further would require moving the logic into C—having it read `queries.json` and handle the interface directly—effectively moving away from Python for day-to-day use. This would fundamentally alter the project’s design, so it’s only worth pursuing if shaving off those few milliseconds is truly a priority. For now, no changes are necessary.
+
+For now, There are two things to look at: the initial executions and what lies beneath.
+
+The initial executions should be disregarded. The first run of each command takes significantly longer: 288 ms versus 43 ms for the interpreter, and 543 ms versus 108 ms for `--list-profiles`. This is a typical Windows effect—due to a cold cache and antivirus software scanning files—rather than an issue with the program itself. The second execution of each command provides a more representative result.
+
+
+| What | Time | Share of command |
+| :--- | :--- | :--- |
+| Starting the Python interpreter (`python -c pass`) | 43 ms | ~32% |
+| What `loggrep.py` does before searching (imports, `argparse`, loading `queries.json`) | ~65 ms (108 - 43) | ~48% |
+| Launching `log_searcher.exe` and searching | ~28 ms | ~20% |
+
+
+That accounts for the 136 ms you measured for the entire command. In other words, on your machine, about 80% of the time spent searching through 1 million lines is taken up by Python starting up.
+
+-- Comments: Windows takes even longer for the same process. On my the Linux mv I used, `loggrep.py` adds about 21 ms on top of the interpreter’s startup time, whereas on my Windows system it’s around 65 ms—three times as much. Every module that gets imported requires reading files from the disk, and that’s where Windows—especially with antivirus software—is significantly slower. That is why this area offers the most room for further improvement.
+
+### 12/11/2026
+
+I used python -X importtime loggrep.py --list-profiles 2> imports.txt
+
+My data reveals a lot. The heaviest components aren't `json` or `subprocess`; rather, they are `shutil` (11.4 ms) and `_colorize` (20 ms). In your version of Python, these are loaded by `argparse` when the parser is instantiated (the list including `compression.zstd`, `annotationlib`, and `_colorize` is specific to Python 3.14). That’s about 31 ms spent just on reading the options. For now, I'll remove `argparse` from the standard execution path—I’ll implement a custom options reader, keeping `argparse` only as a fallback for `--help`, error handling, and any non-standard use cases.
+
+My data pointed to a specific culprit, and I’ve now removed it: it’s `argparse`, which, in your Python environment, loads `shutil` and `_colorize` as soon as the parser is created. Together, these two add about 31 ms to the import time—just for reading the options. I only need to modify one file: `loggrep.py`.
+
+Here’s how it works now: the options are defined in a single table, which is used both by a custom reader and by `argparse`. The custom reader handles standard formats (e.g., `-p errors`, `--engine=c`, or a value provided in the following argument). For anything else—such as `--help`, shorthand flags like `--no-col` or `-m5`, usage errors, or the specification of a second file—control is handed over to `argparse`. In those cases, the behavior remains exactly as it was before. As a result, `argparse`, `shutil`, `gettext`, `bz2`, and `lzma` are no longer loaded during a standard search.
+
+#### Checks:
+
+- Compared against `argparse`: 120,000 randomized command lines—including valid options, noise, abbreviations, empty values, and values ​​starting with `-`. The custom parser successfully processed approximately 39,400 of these, yielding the exact same results as `argparse` in every single case, with no discrepancies whatsoever. The remaining inputs were passed on to `argparse`.
+- `--help` and error handling: these continue to be managed by `argparse`, maintaining the standard output text and an exit code of 2.
+- `selftest.py`: 445 out of 445 tests passed.
