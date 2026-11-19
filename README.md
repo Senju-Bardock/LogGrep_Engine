@@ -238,3 +238,41 @@ Here’s how it works now: the options are defined in a single table, which is u
 - Compared against `argparse`: 120,000 randomized command lines—including valid options, noise, abbreviations, empty values, and values ​​starting with `-`. The custom parser successfully processed approximately 39,400 of these, yielding the exact same results as `argparse` in every single case, with no discrepancies whatsoever. The remaining inputs were passed on to `argparse`.
 - `--help` and error handling: these continue to be managed by `argparse`, maintaining the standard output text and an exit code of 2.
 - `selftest.py`: 445 out of 445 tests passed.
+
+-- Comments: Seems I need to check again due to a file conflict, but everything is going normal. For now I'll be busy, but this project is almost done. The Python project would be done the moment I test his functions and look at the results.
+
+### 19/11/2026
+
+This time it is the correct file, and the definitive test confirms it. The final `findstr` command outputs nothing, which means `argparse`, `shutil`, and `_colorize` are no longer being loaded.
+
+| Metric | Before | Now |
+| :--- | :---: | :---: |
+| `--list-profiles` | 108 ms | 58.9 ms |
+| `-p errors --count`, 1M lines (full command) | 136 ms | 88.4 ms |
+
+That’s 49 ms less for `--list-profiles` (nearly half) and 48 ms less for the full command—a 35% improvement. This aligns with what I estimated based on your imports (about 31 ms from `shutil` and `_colorize`, plus the rest of what they pulled in), so this time the estimate was reasonable.
+
+Here is the breakdown for the 88 ms full command:
+
+| What | Time | Share |
+| :--- | :---: | :---: |
+| Starting the Python interpreter (your previously measured 43 ms) | ~43 ms | ~49% |
+| What `loggrep.py` does before searching | ~16 ms (59 - 43) | ~18% |
+| Launching C and searching | ~29 ms | ~33% |
+
+Half of the time is taken up by Python’s own startup process, which is independent of our code. The time contributed by `loggrep.py` has dropped from about 65 ms to around 16 ms.
+
+What’s left to do in Python? Very little: those ~16 ms are accounted for by the imports of `json`, `subprocess`, and `re`, and removing them would cost more than the benefit they provide. The only way to achieve a significant reduction in time would be to move away from Python—specifically, by implementing the design change I mentioned (having the C code read `queries.json` and display the summary). That would bring the execution time for a command like this down from ~88 ms to about 30–40 ms; however, I have to decide whether it’s worth duplicating the interface and keeping both versions synchronized. For large files, it’s no longer relevant: the search process dominates the runtime, and with multithreading, that takes only 0.03 seconds.
+
+As far as I’m concerned, this phase is complete. The repository is up to date, the automated tests are passing (445 out of 445), and the data supports these results.
+
+What remains is step 2—the only item on the list I haven’t addressed yet. It involves having `log_searcher.exe` read `queries.json` and generate the summary itself, eliminating the need for Python in day-to-day use. This is essentially what I was planning to when I said the Python phase could be considered complete.
+
+Here’s what that would entail:
+
+Benefit: On my machine, a command like `-p errors --count` run against 1 million lines would drop from ~88 ms to about 30–35 ms. This estimate is based on my own measurements (the ~29 ms it already takes for the C program to launch and perform the search, excluding the ~43 ms overhead from Python). For large files like `big.log`, there would be no change, as the search process itself is the dominant factor.
+Cost: It would require implementing a JSON parser in C (roughly 300 lines of code), along with logic to handle the `-p` flag, `queries.json`, and the summary generation. Features like color highlighting, regex patterns not supported by the C implementation, and Python-based exports would still require `loggrep.py`. This would result in two ways to run the program—both producing the same output—which would need to be kept in sync. Automated testing would help ensure this, just as it does now.
+
+My take: This is only worthwhile if latency matters to you when working with small or medium-sized files—for instance, if I use it as a daily command-line tool where 88 ms is noticeable. If I'm working with large log files, the execution time is already in the 0.03–0.3 s range, making the improvement virtually imperceptible. The project can be considered fully complete even without this step.
+
+But for now, I'll be doing it
